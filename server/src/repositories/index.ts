@@ -32,6 +32,8 @@ import { PartnerRepository } from 'src/repositories/partner.repository';
 import { PersonRepository } from 'src/repositories/person.repository';
 import { PluginRepository } from 'src/repositories/plugin.repository';
 import { ProcessRepository } from 'src/repositories/process.repository';
+import { RemoteMediaAdapterRepository } from 'src/repositories/remote-media-adapter.repository';
+import { RemoteStorageRepository } from 'src/repositories/remote-storage.repository';
 import { SearchRepository } from 'src/repositories/search.repository';
 import { ServerInfoRepository } from 'src/repositories/server-info.repository';
 import { SessionRepository } from 'src/repositories/session.repository';
@@ -87,6 +89,8 @@ export const repositories = [
   PersonRepository,
   PluginRepository,
   ProcessRepository,
+  RemoteStorageRepository,
+  RemoteMediaAdapterRepository,
   SearchRepository,
   SessionRepository,
   ServerInfoRepository,
@@ -101,9 +105,9 @@ export const repositories = [
   TelemetryRepository,
   TrashRepository,
   UserRepository,
-  ViewRepository,
   VersionHistoryRepository,
   VideoStreamRepository,
+  ViewRepository,
   WebsocketRepository,
   WorkflowRepository,
 ];
