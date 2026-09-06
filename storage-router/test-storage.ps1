@@ -22,10 +22,12 @@ try {
     Write-Host "Storage Router: $RouterUrl"
     Write-Host "Test path: $TestPath"
 
-    # PUT
+    # PUT: a new file may return 200 or 201.
     $put = Invoke-WebRequest -Uri $Uri -Method Put -Headers $Headers -ContentType 'text/plain' -Body $Body -UseBasicParsing
-    Assert-Status $put.StatusCode 200 'PUT'
-    Write-Host '[PASS] PUT'
+    if ($put.StatusCode -notin @(200, 201)) {
+        throw "PUT failed: expected HTTP 200 or 201, got HTTP $($put.StatusCode)"
+    }
+    Write-Host "[PASS] PUT (HTTP $($put.StatusCode))"
 
     # HEAD
     $head = Invoke-WebRequest -Uri $Uri -Method Head -Headers $Headers -UseBasicParsing
@@ -40,14 +42,16 @@ try {
     $get = Invoke-WebRequest -Uri $Uri -Method Get -Headers $Headers -UseBasicParsing
     Assert-Status $get.StatusCode 200 'GET'
     if ($get.Content -ne $Body) {
-        throw "GET failed: response body does not match PUT body"
+        throw 'GET failed: response body does not match PUT body'
     }
     Write-Host '[PASS] GET (content matches)'
 
-    # DELETE
+    # DELETE: both 200 and 204 are valid successful responses.
     $delete = Invoke-WebRequest -Uri $Uri -Method Delete -Headers $Headers -UseBasicParsing
-    Assert-Status $delete.StatusCode 200 'DELETE'
-    Write-Host '[PASS] DELETE'
+    if ($delete.StatusCode -notin @(200, 204)) {
+        throw "DELETE failed: expected HTTP 200 or 204, got HTTP $($delete.StatusCode)"
+    }
+    Write-Host "[PASS] DELETE (HTTP $($delete.StatusCode))"
 
     # Verify deletion with HEAD. PowerShell may throw on 404, so capture it explicitly.
     try {
