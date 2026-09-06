@@ -15,8 +15,7 @@ WORKDIR /usr/src/app
 COPY ./server ./server/
 COPY ./packages/sdk ./packages/sdk/
 COPY ./packages/plugin-sdk ./packages/plugin-sdk/
-RUN --mount=type=cache,id=cacheKey-pnpm-server,target=/buildcache/pnpm-store \
-  --mount=type=bind,source=package.json,target=package.json \
+RUN --mount=type=bind,source=package.json,target=package.json \
   --mount=type=bind,source=.pnpmfile.cjs,target=.pnpmfile.cjs \
   --mount=type=bind,source=pnpm-lock.yaml,target=pnpm-lock.yaml \
   --mount=type=bind,source=pnpm-workspace.yaml,target=pnpm-workspace.yaml \
@@ -32,8 +31,7 @@ WORKDIR /usr/src/app
 COPY ./web ./web/
 COPY ./i18n ./i18n/
 COPY ./packages ./packages/
-RUN --mount=type=cache,id=cacheKey-pnpm-web,target=/buildcache/pnpm-store \
-  --mount=type=bind,source=package.json,target=package.json \
+RUN --mount=type=bind,source=package.json,target=package.json \
   --mount=type=bind,source=.pnpmfile.cjs,target=.pnpmfile.cjs \
   --mount=type=bind,source=pnpm-lock.yaml,target=pnpm-lock.yaml \
   --mount=type=bind,source=pnpm-workspace.yaml,target=pnpm-workspace.yaml \
@@ -43,8 +41,7 @@ RUN --mount=type=cache,id=cacheKey-pnpm-web,target=/buildcache/pnpm-store \
 FROM builder AS cli
 
 COPY ./packages ./packages/
-RUN --mount=type=cache,id=cacheKey-pnpm-cli,target=/buildcache/pnpm-store \
-  --mount=type=bind,source=package.json,target=package.json \
+RUN --mount=type=bind,source=package.json,target=package.json \
   --mount=type=bind,source=.pnpmfile.cjs,target=.pnpmfile.cjs \
   --mount=type=bind,source=pnpm-lock.yaml,target=pnpm-lock.yaml \
   --mount=type=bind,source=pnpm-workspace.yaml,target=pnpm-workspace.yaml \
@@ -64,20 +61,17 @@ COPY ./packages/plugin-core/mise.toml ./packages/plugin-core/
 ENV MISE_TRUSTED_CONFIG_PATHS=/app/mise.toml
 ENV MISE_DATA_DIR=/buildcache/mise
 ENV MISE_DISABLE_TOOLS=flutter
-RUN --mount=type=cache,id=cacheKey-mise-tools-${TARGETPLATFORM},target=/buildcache/mise \
-  mise install
+RUN mise install
 
 COPY ./packages/sdk ./packages/sdk/
 COPY ./packages/plugin-core ./packages/plugin-core/
 COPY ./packages/plugin-sdk ./packages/plugin-sdk/
 
 # Build plugins
-RUN --mount=type=cache,id=cacheKey-pnpm-packages,target=/buildcache/pnpm-store \
-  --mount=type=bind,source=package.json,target=package.json \
+RUN --mount=type=bind,source=package.json,target=package.json \
   --mount=type=bind,source=.pnpmfile.cjs,target=.pnpmfile.cjs \
   --mount=type=bind,source=pnpm-lock.yaml,target=pnpm-lock.yaml \
   --mount=type=bind,source=pnpm-workspace.yaml,target=pnpm-workspace.yaml \
-  --mount=type=cache,id=cacheKey-mise-tools-${TARGETPLATFORM},target=/buildcache/mise \
   mise //:plugins
 
 FROM ghcr.io/immich-app/base-server-prod:202607211135@sha256:ced131da7523544fe975cfd25abd67386e712e39496340b437cd95a08d0a18f3
@@ -113,7 +107,6 @@ ENV IMMICH_SOURCE_REF=${BUILD_SOURCE_REF}
 ENV IMMICH_SOURCE_COMMIT=${BUILD_SOURCE_COMMIT}
 ENV IMMICH_SOURCE_URL=https://github.com/immich-app/immich/commit/${BUILD_SOURCE_COMMIT}
 
-VOLUME /data
 EXPOSE 2283
 ENTRYPOINT ["tini", "--", "/bin/bash", "-c"]
 CMD ["start.sh"]
