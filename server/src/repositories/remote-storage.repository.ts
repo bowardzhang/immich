@@ -20,7 +20,31 @@ export class RemoteStorageRepository {
   private relativePath(filepath: string): string { if (!this.isRemotePath(filepath)) throw new Error(`Not a remote path: ${filepath}`); const relative = filepath.slice(this.prefix.length).replace(/^\/+/, ''); const normalized = path.posix.normalize(`/${relative}`).replace(/^\/+/, ''); if (normalized === '..' || normalized.startsWith('../')) throw new Error(`Path traversal is not allowed: ${filepath}`); return normalized; }
   private buildUrl(endpoint: 'list' | 'file' | 'storage', relativePath: string, recursive = false, source?: string): URL { if (!this.baseUrl) throw new Error('REMOTE_STORAGE_URL is not configured'); const url = new URL(`/api/${endpoint}`, this.baseUrl); if (endpoint !== 'storage') { url.searchParams.set('path', relativePath); if (endpoint === 'list') url.searchParams.set('recursive', String(recursive)); if (source !== undefined) url.searchParams.set('source', source); } return url; }
   private headers(): HeadersInit { return this.token ? { Authorization: `Bearer ${this.token}` } : {}; }
-  private async request(url: URL, init?: RequestInitWithDuplex): Promise<Response> { const response = await fetch(url, { ...init, headers: { ...this.headers(), ...(init?.headers || {}) } }); if (!response.ok) { const error = new Error(`Remote storage request failed: ${response.status} ${response.statusText}`); Object.assign(error, { code: response.status === 404 ? 'ENOENT' : 'EREMOTE' }); throw error; } return response; }
+  private async request(url: URL, init?: RequestInitWithDuplex): Promise<Response> {
+    const maxAttempts = 3;
+    let lastError: unknown;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        const response = await fetch(url, {
+          ...init,
+          headers: { ...this.headers(), ...(init?.headers || {}) },
+          signal: init?.signal || AbortSignal.timeout(20_000),
+        });
+        if (response.ok) return response;
+        if (![429, 502, 503, 504].includes(response.status) || attempt === maxAttempts) {
+          const error = new Error(`Remote storage request failed: ${response.status} ${response.statusText}`);
+          Object.assign(error, { code: response.status === 404 ? 'ENOENT' : 'EREMOTE' });
+          throw error;
+        }
+        lastError = new Error(`Remote storage transient failure: ${response.status} ${response.statusText}`);
+      } catch (error) {
+        lastError = error;
+        if (attempt === maxAttempts || (error as any)?.code === 'ENOENT') throw error;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 250 * 2 ** (attempt - 1)));
+    }
+    throw lastError instanceof Error ? lastError : new Error(String(lastError));
+  }
   private async uploadFile(localPath: string, remotePath: string) { const stat = await fs.stat(localPath); const body = Readable.toWeb(createReadStream(localPath)) as unknown as BodyInit; const response = await this.request(this.buildUrl('file', this.relativePath(remotePath)), { method: 'PUT', body, duplex: 'half', headers: { 'content-length': String(stat.size), 'content-type': mimeTypes.lookup(localPath) } }); await response.arrayBuffer(); }
   async stat(filepath: string): Promise<Stats> { const response = await this.request(this.buildUrl('file', this.relativePath(filepath)), { method: 'HEAD' }); const size = Number(response.headers.get('content-length') || 0); const modified = response.headers.get('last-modified'); const mtime = modified ? new Date(modified) : new Date(0); const isDirectory = response.headers.get('x-remote-type') === 'directory'; return { size, mtime, mtimeMs: mtime.getTime(), ctime: mtime, ctimeMs: mtime.getTime(), birthtime: mtime, birthtimeMs: mtime.getTime(), atime: mtime, atimeMs: mtime.getTime(), dev: 0, ino: 0, mode: isDirectory ? 0o755 : 0o644, nlink: 1, uid: 0, gid: 0, rdev: 0, blksize: 4096, blocks: Math.ceil(size / 512), isDirectory: () => isDirectory, isFile: () => !isDirectory, isBlockDevice: () => false, isCharacterDevice: () => false, isSymbolicLink: () => false, isFIFO: () => false, isSocket: () => false } as Stats; }
   async checkFileExists(filepath: string, mode = constants.F_OK): Promise<boolean> { if (mode !== constants.F_OK && mode !== constants.R_OK && mode !== constants.W_OK) return false; try { await this.stat(filepath); return true; } catch { return false; } }
