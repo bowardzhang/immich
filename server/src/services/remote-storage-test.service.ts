@@ -1,16 +1,28 @@
 import { Injectable } from '@nestjs/common';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+import { readFile, rm } from 'node:fs/promises';
+import sharp from 'sharp';
 import { OnEvent } from 'src/decorators';
-import { BootstrapEventPriority } from 'src/enum';
+import { BootstrapEventPriority, StorageFolder } from 'src/enum';
+import { StorageCore } from 'src/cores/storage.core';
 import { RemoteStorageRepository } from 'src/repositories/remote-storage.repository';
 import { StorageRepository } from 'src/repositories/storage.repository';
 import { LoggingRepository } from 'src/repositories/logging.repository';
+import { UserRepository } from 'src/repositories/user.repository';
+import { AssetMediaService } from 'src/services/asset-media.service';
+import { AssetMediaCreateDto } from 'src/dtos/asset-media.dto';
+
+const execFileAsync = promisify(execFile);
 
 @Injectable()
 export class RemoteStorageTestService {
   constructor(
     private remoteStorageRepository: RemoteStorageRepository,
     private storageRepository: StorageRepository,
+    private assetMediaService: AssetMediaService,
+    private userRepository: UserRepository,
     private logger: LoggingRepository,
   ) {
     this.logger.setContext(RemoteStorageTestService.name);
@@ -24,6 +36,11 @@ export class RemoteStorageTestService {
       return;
     }
 
+    await this.runRepositoryCanary();
+    await this.runRealMediaCanary();
+  }
+
+  private async runRepositoryCanary() {
     const id = randomUUID();
     const root = '/remote/photo-extern/.immich-router-canary';
     const source = `${root}/${id}.bin`;
@@ -63,5 +80,85 @@ export class RemoteStorageTestService {
         this.logger.warn(`Remote storage canary cleanup failed: ${(cleanupError as Error).message}`);
       }
     }
+  }
+
+  private async runRealMediaCanary() {
+    const admin = await this.userRepository.getAdmin();
+    if (!admin) {
+      this.logger.warn('Real media canary skipped: no admin user exists');
+      return;
+    }
+
+    const auth = { user: admin } as any;
+    const now = new Date();
+    const imageId = randomUUID();
+    const videoId = randomUUID();
+    const tmpVideo = `/tmp/immich-remote-canary-${videoId}.mp4`;
+
+    try {
+      const imageBuffer = await sharp({
+        create: { width: 64, height: 48, channels: 3, background: { r: 80, g: 120, b: 160 } },
+      })
+        .jpeg({ quality: 85 })
+        .toBuffer();
+
+      const imagePath = await this.writeSyntheticAsset(auth.user.id, imageId, '.jpg', imageBuffer);
+      const imageResult = await this.assetMediaService.uploadAsset(
+        auth,
+        {
+          fileCreatedAt: now,
+          fileModifiedAt: now,
+          filename: 'remote-canary-image.jpg',
+          isFavorite: false,
+          assetData: undefined,
+        } as unknown as AssetMediaCreateDto,
+        this.makeUploadFile(imagePath, imageBuffer, 'remote-canary-image.jpg', imageId),
+      );
+      this.logger.log(`Remote real image upload PASS: ${imageResult.id} (${imageResult.status})`);
+
+      await execFileAsync('ffmpeg', [
+        '-hide_banner', '-loglevel', 'error',
+        '-f', 'lavfi', '-i', 'color=c=black:s=160x120:r=5',
+        '-t', '1', '-an', '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-movflags', '+faststart',
+        '-y', tmpVideo,
+      ]);
+      const videoBuffer = await readFile(tmpVideo);
+      const videoPath = await this.writeSyntheticAsset(auth.user.id, videoId, '.mp4', videoBuffer);
+      const videoResult = await this.assetMediaService.uploadAsset(
+        auth,
+        {
+          fileCreatedAt: now,
+          fileModifiedAt: now,
+          filename: 'remote-canary-video.mp4',
+          isFavorite: false,
+          duration: 1000,
+          assetData: undefined,
+        } as unknown as AssetMediaCreateDto,
+        this.makeUploadFile(videoPath, videoBuffer, 'remote-canary-video.mp4', videoId),
+      );
+      this.logger.log(`Remote real video upload PASS: ${videoResult.id} (${videoResult.status})`);
+    } catch (error) {
+      this.logger.error(`Remote real media canary FAIL: ${(error as Error).message}`, (error as Error).stack);
+    } finally {
+      await rm(tmpVideo, { force: true }).catch(() => undefined);
+    }
+  }
+
+  private async writeSyntheticAsset(userId: string, uuid: string, extension: string, data: Buffer) {
+    const folder = StorageCore.getNestedFolder(StorageFolder.Upload, userId, uuid);
+    this.storageRepository.mkdirSync(folder);
+    const path = `${folder}/${uuid}${extension}`;
+    await this.storageRepository.createFile(path, data);
+    return path;
+  }
+
+  private makeUploadFile(path: string, data: Buffer, originalName: string, uuid: string) {
+    return {
+      uuid,
+      originalName,
+      originalPath: path,
+      size: data.length,
+      checksum: createHash('sha1').update(data).digest(),
+    } as any;
   }
 }
