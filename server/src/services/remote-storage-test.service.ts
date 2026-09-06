@@ -36,8 +36,25 @@ export class RemoteStorageTestService {
       return;
     }
 
+    await this.ensureRemoteMediaMarkers();
     await this.runRepositoryCanary();
     await this.runRealMediaCanary();
+  }
+
+  private async ensureRemoteMediaMarkers() {
+    const folders = [StorageFolder.Upload, StorageFolder.Thumbnails, StorageFolder.EncodedVideo, StorageFolder.Profile];
+    const marker = Buffer.from('immich remote storage marker\n');
+    try {
+      for (const folder of folders) {
+        const markerPath = `${StorageCore.getBaseFolder(folder)}/.immich`;
+        if (!(await this.storageRepository.checkFileExists(markerPath))) {
+          await this.storageRepository.createFile(markerPath, marker);
+          this.logger.log(`Remote media marker initialized: ${markerPath}`);
+        }
+      }
+    } catch (error) {
+      this.logger.error(`Remote media marker initialization failed: ${(error as Error).message}`);
+    }
   }
 
   private async runRepositoryCanary() {
