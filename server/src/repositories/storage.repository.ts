@@ -26,7 +26,7 @@ export class StorageRepository {
   copyFile(source: string, target: string) {
     if (this.remoteStorageRepository.isRemotePath(source)) {
       if (this.remoteStorageRepository.isRemotePath(target)) return this.remoteStorageRepository.copyFile(source, target);
-      return new Promise<void>((resolve, reject) => this.remoteStorageRepository.createPlainReadStream(source).then((stream) => { const output = createWriteStream(target); stream.pipe(output).on('finish', resolve).on('error', reject); }).catch(reject));
+      return new Promise<void>((resolve, reject) => { const stream = this.remoteStorageRepository.createPlainReadStream(source); const output = createWriteStream(target); stream.pipe(output).on('finish', resolve).on('error', reject); stream.on('error', reject); });
     }
     if (this.remoteStorageRepository.isRemotePath(target)) return new Promise<void>((resolve, reject) => { const input = createReadStream(source); const output = this.remoteStorageRepository.createWriteStream(target); input.pipe(output).on('finish', resolve).on('error', reject); });
     return fs.copyFile(source, target);
@@ -39,17 +39,9 @@ export class StorageRepository {
   rename(source: string, target: string) { if (this.remoteStorageRepository.isRemotePath(source) && this.remoteStorageRepository.isRemotePath(target)) return this.remoteStorageRepository.rename(source, target); if (this.remoteStorageRepository.isRemotePath(source)) return this.copyFile(source, target).then(() => this.unlink(source)); if (this.remoteStorageRepository.isRemotePath(target)) return this.copyFile(source, target).then(() => this.unlink(source)); return fs.rename(source, target); }
   utimes(filepath: string, atime: Date, mtime: Date) { return this.remoteStorageRepository.isRemotePath(filepath) ? this.remoteStorageRepository.utimes(filepath, atime, mtime) : fs.utimes(filepath, atime, mtime); }
   createZipStream(): ImmichZipStream {
-    const archive = archiver('zip', { store: true });
-    const pending: Promise<void>[] = [];
-    const addFile = (input: string, filename: string) => {
-      if (!this.remoteStorageRepository.isRemotePath(input)) { archive.file(input, { name: filename, mode: 0o644 }); return; }
-      const passThrough = new PassThrough();
-      archive.append(passThrough, { name: filename, mode: 0o644 });
-      const pendingRead = Promise.resolve(this.remoteStorageRepository.createPlainReadStream(input)).then((stream) => new Promise<void>((resolve, reject) => { stream.on('error', reject); passThrough.on('error', reject); passThrough.on('finish', resolve); stream.pipe(passThrough); }));
-      pending.push(pendingRead);
-    };
-    const finalize = async () => { await Promise.all(pending); await archive.finalize(); };
-    return { stream: archive, addFile, finalize };
+    const archive = archiver('zip', { store: true }); const pending: Promise<void>[] = [];
+    const addFile = (input: string, filename: string) => { if (!this.remoteStorageRepository.isRemotePath(input)) { archive.file(input, { name: filename, mode: 0o644 }); return; } const passThrough = new PassThrough(); archive.append(passThrough, { name: filename, mode: 0o644 }); const pendingRead = Promise.resolve(this.remoteStorageRepository.createPlainReadStream(input)).then((stream) => new Promise<void>((resolve, reject) => { stream.on('error', reject); passThrough.on('error', reject); passThrough.on('finish', resolve); stream.pipe(passThrough); })); pending.push(pendingRead); };
+    const finalize = async () => { await Promise.all(pending); await archive.finalize(); }; return { stream: archive, addFile, finalize };
   }
   createGzip(): PassThrough { return createGzip(); }
   createGunzip(): PassThrough { return createGunzip(); }
