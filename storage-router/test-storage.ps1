@@ -11,6 +11,7 @@ $TestPath = "router-integration-test/$([guid]::NewGuid().ToString()).txt"
 $Body = "Immich Storage Router integration test - $([guid]::NewGuid())"
 $Headers = @{ Authorization = "Bearer $Token" }
 $Uri = "$RouterUrl/api/file?path=$([uri]::EscapeDataString($TestPath))"
+$TempFile = Join-Path ([System.IO.Path]::GetTempPath()) ("storage-router-test-{0}.bin" -f [guid]::NewGuid())
 
 function Assert-Status($Actual, $Expected, $Step) {
     if ($Actual -ne $Expected) {
@@ -32,20 +33,21 @@ try {
     # HEAD
     $head = Invoke-WebRequest -Uri $Uri -Method Head -Headers $Headers -UseBasicParsing
     Assert-Status $head.StatusCode 200 'HEAD'
-    $expectedLength = [Text.Encoding]::UTF8.GetByteCount($Body)
+    $expectedBytes = [Text.Encoding]::UTF8.GetBytes($Body)
     $contentLengthHeader = @($head.Headers['Content-Length']) | Select-Object -First 1
-    if ([int64]$contentLengthHeader -ne $expectedLength) {
-        throw "HEAD failed: expected Content-Length $expectedLength, got $contentLengthHeader"
+    if ([int64]$contentLengthHeader -ne $expectedBytes.Length) {
+        throw "HEAD failed: expected Content-Length $($expectedBytes.Length), got $contentLengthHeader"
     }
-    Write-Host "[PASS] HEAD (Content-Length=$expectedLength)"
+    Write-Host "[PASS] HEAD (Content-Length=$($expectedBytes.Length))"
 
-    # GET
-    $get = Invoke-WebRequest -Uri $Uri -Method Get -Headers $Headers -UseBasicParsing
+    # GET: compare raw bytes, avoiding PowerShell text encoding/newline conversion.
+    $get = Invoke-WebRequest -Uri $Uri -Method Get -Headers $Headers -UseBasicParsing -OutFile $TempFile -PassThru
     Assert-Status $get.StatusCode 200 'GET'
-    if ($get.Content -ne $Body) {
-        throw 'GET failed: response body does not match PUT body'
+    $actualBytes = [System.IO.File]::ReadAllBytes($TempFile)
+    if (-not [System.Linq.Enumerable]::SequenceEqual([byte[]]$actualBytes, [byte[]]$expectedBytes)) {
+        throw "GET failed: response bytes do not match PUT bytes (expected=$($expectedBytes.Length), actual=$($actualBytes.Length))"
     }
-    Write-Host '[PASS] GET (content matches)'
+    Write-Host '[PASS] GET (raw bytes match)'
 
     # DELETE: both 200 and 204 are valid successful responses.
     $delete = Invoke-WebRequest -Uri $Uri -Method Delete -Headers $Headers -UseBasicParsing
@@ -79,4 +81,5 @@ finally {
     catch {
         # Ignore cleanup errors; preserve the original test failure.
     }
+    Remove-Item -LiteralPath $TempFile -Force -ErrorAction SilentlyContinue
 }
