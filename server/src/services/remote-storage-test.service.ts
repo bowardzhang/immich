@@ -108,8 +108,9 @@ export class RemoteStorageTestService {
       const r = Math.floor(Math.random() * 255);
       const g = Math.floor(Math.random() * 255);
       const b = Math.floor(Math.random() * 255);
+      const hexColor = `0x${[r, g, b].map((value) => value.toString(16).padStart(2, '0')).join('')}`;
       await execFileAsync('ffmpeg', [
-        '-hide_banner', '-loglevel', 'error', '-f', 'lavfi', '-i', `color=c=rgb(${r}:${g}:${b}):s=160x120:r=5`,
+        '-hide_banner', '-loglevel', 'error', '-f', 'lavfi', '-i', `color=c=${hexColor}:s=160x120:r=5`,
         '-t', '1', '-an', '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-movflags', '+faststart', '-y', tmpVideo,
       ]);
       const videoBuffer = await readFile(tmpVideo);
