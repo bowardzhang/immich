@@ -2,7 +2,7 @@ import { Injectable } from '@nestjs/common';
 import archiver from 'archiver';
 import chokidar, { ChokidarOptions } from 'chokidar';
 import { escapePath, glob, globStream } from 'fast-glob';
-import { constants, createReadStream, createWriteStream, Dirent, existsSync, mkdirSync, ReadOptionsWithBuffer } from 'node:fs';
+import { constants, createReadStream, createWriteStream, Dirent, existsSync, mkdirSync, ReadOptionsWithBuffer, watch as fsWatch, FSWatcher } from 'node:fs';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { PassThrough, Readable, Writable } from 'node:stream';
@@ -45,7 +45,7 @@ export class StorageRepository {
       if (!this.remoteStorageRepository.isRemotePath(input)) { archive.file(input, { name: filename, mode: 0o644 }); return; }
       const passThrough = new PassThrough();
       archive.append(passThrough, { name: filename, mode: 0o644 });
-      const pendingRead = this.remoteStorageRepository.createPlainReadStream(input).then((stream) => new Promise<void>((resolve, reject) => { stream.on('error', reject); passThrough.on('error', reject); passThrough.on('finish', resolve); stream.pipe(passThrough); }));
+      const pendingRead = Promise.resolve(this.remoteStorageRepository.createPlainReadStream(input)).then((stream) => new Promise<void>((resolve, reject) => { stream.on('error', reject); passThrough.on('error', reject); passThrough.on('finish', resolve); stream.pipe(passThrough); }));
       pending.push(pendingRead);
     };
     const finalize = async () => { await Promise.all(pending); await archive.finalize(); };
@@ -67,6 +67,6 @@ export class StorageRepository {
   crawl(crawlOptions: CrawlOptionsDto): Promise<string[]> { const { pathsToCrawl, exclusionPatterns, includeHidden } = crawlOptions; if (pathsToCrawl.length === 0) return Promise.resolve([]); const remotePaths = pathsToCrawl.filter((crawlPath) => this.remoteStorageRepository.isRemotePath(crawlPath)); const localPaths = pathsToCrawl.filter((crawlPath) => !this.remoteStorageRepository.isRemotePath(crawlPath)); if (remotePaths.length && localPaths.length) return Promise.all([this.remoteStorageRepository.crawl({ pathsToCrawl: remotePaths, exclusionPatterns, includeHidden }), glob(localPaths.map((crawlPath) => this.asGlob(crawlPath)), { absolute: true, caseSensitiveMatch: false, onlyFiles: true, dot: includeHidden, ignore: exclusionPatterns })]).then(([remote, local]) => [...remote, ...local]); if (remotePaths.length) return this.remoteStorageRepository.crawl({ pathsToCrawl: remotePaths, exclusionPatterns, includeHidden }); return glob(localPaths.map((crawlPath) => this.asGlob(crawlPath)), { absolute: true, caseSensitiveMatch: false, onlyFiles: true, dot: includeHidden, ignore: exclusionPatterns }); }
   async *walk(walkOptions: WalkOptionsDto): AsyncGenerator<string[]> { const { pathsToCrawl, exclusionPatterns, includeHidden } = walkOptions; if (pathsToCrawl.length === 0) return; const remotePaths = pathsToCrawl.filter((crawlPath) => this.remoteStorageRepository.isRemotePath(crawlPath)); const localPaths = pathsToCrawl.filter((crawlPath) => !this.remoteStorageRepository.isRemotePath(crawlPath)); if (remotePaths.length) for await (const batch of this.remoteStorageRepository.walk({ ...walkOptions, pathsToCrawl: remotePaths })) yield batch; if (!localPaths.length) return; const stream = globStream(localPaths.map((crawlPath) => this.asGlob(crawlPath)), { absolute: true, caseSensitiveMatch: false, onlyFiles: true, dot: includeHidden, ignore: exclusionPatterns }); let batch: string[] = []; for await (const value of stream) { batch.push(value.toString()); if (batch.length === walkOptions.take) { yield batch; batch = []; } } if (batch.length) yield batch; }
   watch(paths: string[], options: ChokidarOptions, events: Partial<WatchEvents>) { if (paths.some((watchPath) => this.remoteStorageRepository.isRemotePath(watchPath))) throw new Error('Remote external library watching is not supported; disable library watching for remote libraries'); const watcher = chokidar.watch(paths, options); watcher.on('ready', () => events.onReady?.()); watcher.on('add', (p) => events.onAdd?.(p)); watcher.on('change', (p) => events.onChange?.(p)); watcher.on('unlink', (p) => events.onUnlink?.(p)); watcher.on('error', (error) => events.onError?.(error as Error)); return () => watcher.close(); }
-  watchDir = this.watch;
+  watchDir(directory: string, listener: (eventType: string, filename: string | Buffer | null) => void): FSWatcher { if (this.remoteStorageRepository.isRemotePath(directory)) throw new Error('Remote external library directory watching is not supported'); return fsWatch(directory, listener); }
   private asGlob(pathToCrawl: string): string { const escapedPath = escapePath(pathToCrawl).replaceAll('"', '["]').replaceAll("'", "[']").replaceAll('`', '[`]'); const extensions = `*{${mimeTypes.getSupportedFileExtensions().join(',')}}`; return `${escapedPath}/**/${extensions}`; }
 }
