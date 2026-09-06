@@ -40,7 +40,7 @@ export class RemoteStorageTestService {
 
     await this.runRepositoryCanary();
     if (this.configRepository.getWorker() === ImmichWorker.Api) {
-      await this.runRealMediaCanary();
+      setTimeout(() => void this.runRealMediaCanary(), 30_000).unref();
     }
   }
 
