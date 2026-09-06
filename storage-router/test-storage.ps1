@@ -33,8 +33,9 @@ try {
     $head = Invoke-WebRequest -Uri $Uri -Method Head -Headers $Headers -UseBasicParsing
     Assert-Status $head.StatusCode 200 'HEAD'
     $expectedLength = [Text.Encoding]::UTF8.GetByteCount($Body)
-    if ([int64]$head.Headers['Content-Length'] -ne $expectedLength) {
-        throw "HEAD failed: expected Content-Length $expectedLength, got $($head.Headers['Content-Length'])"
+    $contentLengthHeader = @($head.Headers['Content-Length']) | Select-Object -First 1
+    if ([int64]$contentLengthHeader -ne $expectedLength) {
+        throw "HEAD failed: expected Content-Length $expectedLength, got $contentLengthHeader"
     }
     Write-Host "[PASS] HEAD (Content-Length=$expectedLength)"
 
