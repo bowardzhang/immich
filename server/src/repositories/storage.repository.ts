@@ -18,6 +18,7 @@ import { PassThrough, Readable, Writable } from 'node:stream';
 import { createGunzip, createGzip } from 'node:zlib';
 import { CrawlOptionsDto, WalkOptionsDto } from 'src/dtos/library.dto';
 import { LoggingRepository } from 'src/repositories/logging.repository';
+import { RemoteStorageRepository } from 'src/repositories/remote-storage.repository';
 import { mimeTypes } from 'src/utils/mime-types';
 
 export interface WatchEvents {
@@ -47,51 +48,87 @@ export interface DiskUsage {
 
 @Injectable()
 export class StorageRepository {
-  constructor(private logger: LoggingRepository) {
+  constructor(
+    private logger: LoggingRepository,
+    private remoteStorageRepository: RemoteStorageRepository,
+  ) {
     this.logger.setContext(StorageRepository.name);
   }
 
   realpath(filepath: string) {
+    if (this.remoteStorageRepository.isRemotePath(filepath)) {
+      return this.remoteStorageRepository.realpath(filepath);
+    }
     return fs.realpath(filepath);
   }
 
   readdir(folder: string): Promise<string[]> {
+    if (this.remoteStorageRepository.isRemotePath(folder)) {
+      return this.remoteStorageRepository.readdir(folder);
+    }
     return fs.readdir(folder);
   }
 
   readdirWithTypes(folder: string): Promise<Dirent[]> {
+    if (this.remoteStorageRepository.isRemotePath(folder)) {
+      return this.remoteStorageRepository.readdirWithTypes(folder) as Promise<Dirent[]>;
+    }
     return fs.readdir(folder, { withFileTypes: true });
   }
 
   copyFile(source: string, target: string) {
+    if (this.remoteStorageRepository.isRemotePath(source) || this.remoteStorageRepository.isRemotePath(target)) {
+      throw new Error('Remote external library files are read-only');
+    }
     return fs.copyFile(source, target);
   }
 
   stat(filepath: string) {
+    if (this.remoteStorageRepository.isRemotePath(filepath)) {
+      return this.remoteStorageRepository.stat(filepath);
+    }
     return fs.stat(filepath);
   }
 
   createFile(filepath: string, buffer: Buffer) {
+    if (this.remoteStorageRepository.isRemotePath(filepath)) {
+      throw new Error('Remote external library files are read-only');
+    }
     return fs.writeFile(filepath, buffer, { flag: 'wx' });
   }
 
   createWriteStream(filepath: string): Writable {
+    if (this.remoteStorageRepository.isRemotePath(filepath)) {
+      throw new Error('Remote external library files are read-only');
+    }
     return createWriteStream(filepath, { flags: 'w', flush: true });
   }
 
   createOrOverwriteFile(filepath: string, buffer: Buffer) {
+    if (this.remoteStorageRepository.isRemotePath(filepath)) {
+      throw new Error('Remote external library files are read-only');
+    }
     return fs.writeFile(filepath, buffer, { flag: 'w' });
   }
 
   overwriteFile(filepath: string, buffer: Buffer) {
+    if (this.remoteStorageRepository.isRemotePath(filepath)) {
+      throw new Error('Remote external library files are read-only');
+    }
     return fs.writeFile(filepath, buffer, { flag: 'r+' });
   }
 
   rename(source: string, target: string) {
+    if (this.remoteStorageRepository.isRemotePath(source) || this.remoteStorageRepository.isRemotePath(target)) {
+      throw new Error('Remote external library files are read-only');
+    }
     return fs.rename(source, target);
   }
 
   utimes(filepath: string, atime: Date, mtime: Date) {
+    if (this.remoteStorageRepository.isRemotePath(filepath)) {
+      throw new Error('Remote external library files are read-only');
+    }
     return fs.utimes(filepath, atime, mtime);
   }
 
@@ -99,6 +136,9 @@ export class StorageRepository {
     const archive = archiver('zip', { store: true });
 
     const addFile = (input: string, filename: string) => {
+      if (this.remoteStorageRepository.isRemotePath(input)) {
+        throw new Error('Remote external library downloads are not supported yet');
+      }
       archive.file(input, { name: filename, mode: 0o644 });
     };
 
@@ -116,10 +156,17 @@ export class StorageRepository {
   }
 
   createPlainReadStream(filepath: string): Readable {
+    if (this.remoteStorageRepository.isRemotePath(filepath)) {
+      return this.remoteStorageRepository.createPlainReadStream(filepath);
+    }
     return createReadStream(filepath);
   }
 
   async createReadStream(filepath: string, mimeType?: string | null): Promise<ImmichReadStream> {
+    if (this.remoteStorageRepository.isRemotePath(filepath)) {
+      return this.remoteStorageRepository.createReadStream(filepath, mimeType);
+    }
+
     const { size } = await fs.stat(filepath);
     await fs.access(filepath, constants.R_OK);
     return {
@@ -130,6 +177,13 @@ export class StorageRepository {
   }
 
   async readFile(filepath: string, options?: ReadOptionsWithBuffer<Buffer>): Promise<Buffer> {
+    if (this.remoteStorageRepository.isRemotePath(filepath)) {
+      if (options) {
+        throw new Error('Remote external library ranged reads are not supported yet');
+      }
+      return this.remoteStorageRepository.readFile(filepath);
+    }
+
     // read a slice
     if (options) {
       const file = await fs.open(filepath);
@@ -146,11 +200,20 @@ export class StorageRepository {
   }
 
   async readJsonFile<T>(filepath: string): Promise<T> {
+    if (this.remoteStorageRepository.isRemotePath(filepath)) {
+      const file = await this.remoteStorageRepository.readFile(filepath);
+      return JSON.parse(file.toString('utf8')) as T;
+    }
+
     const file = await fs.readFile(filepath, 'utf8');
     return JSON.parse(file) as T;
   }
 
   async checkFileExists(filepath: string, mode = constants.F_OK): Promise<boolean> {
+    if (this.remoteStorageRepository.isRemotePath(filepath)) {
+      return this.remoteStorageRepository.checkFileExists(filepath, mode);
+    }
+
     try {
       await fs.access(filepath, mode);
       return true;
@@ -160,6 +223,10 @@ export class StorageRepository {
   }
 
   async unlink(file: string) {
+    if (this.remoteStorageRepository.isRemotePath(file)) {
+      throw new Error('Remote external library files are read-only');
+    }
+
     try {
       await fs.unlink(file);
     } catch (error) {
@@ -172,10 +239,17 @@ export class StorageRepository {
   }
 
   async unlinkDir(folder: string, options: { recursive?: boolean; force?: boolean }) {
+    if (this.remoteStorageRepository.isRemotePath(folder)) {
+      throw new Error('Remote external library files are read-only');
+    }
     await fs.rm(folder, { ...options, maxRetries: 5, retryDelay: 100 });
   }
 
   async removeEmptyDirs(directory: string, self: boolean = false) {
+    if (this.remoteStorageRepository.isRemotePath(directory)) {
+      throw new Error('Remote external library files are read-only');
+    }
+
     // lstat does not follow symlinks (in contrast to stat)
     const stats = await fs.lstat(directory);
     if (!stats.isDirectory()) {
@@ -200,22 +274,27 @@ export class StorageRepository {
   }
 
   mkdirSync(filepath: string): void {
+    if (this.remoteStorageRepository.isRemotePath(filepath)) {
+      throw new Error('Remote external library files are read-only');
+    }
     if (!existsSync(filepath)) {
       mkdirSync(filepath, { recursive: true });
     }
   }
 
   existsSync(filepath: string) {
+    if (this.remoteStorageRepository.isRemotePath(filepath)) {
+      return false;
+    }
     return existsSync(filepath);
   }
 
   async checkDiskUsage(folder: string): Promise<DiskUsage> {
-    const stats = await fs.statfs(folder);
-    return {
+    return fs.statfs(folder).then((stats) => ({
       available: stats.bavail * stats.bsize,
       free: stats.bfree * stats.bsize,
       total: stats.blocks * stats.bsize,
-    };
+    }));
   }
 
   crawl(crawlOptions: CrawlOptionsDto): Promise<string[]> {
@@ -224,8 +303,24 @@ export class StorageRepository {
       return Promise.resolve([]);
     }
 
-    const globbedPaths = pathsToCrawl.map((path) => this.asGlob(path));
+    const remotePaths = pathsToCrawl.filter((crawlPath) => this.remoteStorageRepository.isRemotePath(crawlPath));
+    const localPaths = pathsToCrawl.filter((crawlPath) => !this.remoteStorageRepository.isRemotePath(crawlPath));
 
+    if (remotePaths.length > 0 && localPaths.length > 0) {
+      return Promise.all([
+        this.remoteStorageRepository.crawl({ pathsToCrawl: remotePaths, exclusionPatterns, includeHidden }),
+        glob(
+          localPaths.map((crawlPath) => this.asGlob(crawlPath)),
+          { absolute: true, caseSensitiveMatch: false, onlyFiles: true, dot: includeHidden, ignore: exclusionPatterns },
+        ),
+      ]).then(([remote, local]) => [...remote, ...local]);
+    }
+
+    if (remotePaths.length > 0) {
+      return this.remoteStorageRepository.crawl({ pathsToCrawl: remotePaths, exclusionPatterns, includeHidden });
+    }
+
+    const globbedPaths = localPaths.map((crawlPath) => this.asGlob(crawlPath));
     return glob(globbedPaths, {
       absolute: true,
       caseSensitiveMatch: false,
@@ -238,12 +333,23 @@ export class StorageRepository {
   async *walk(walkOptions: WalkOptionsDto): AsyncGenerator<string[]> {
     const { pathsToCrawl, exclusionPatterns, includeHidden } = walkOptions;
     if (pathsToCrawl.length === 0) {
-      async function* emptyGenerator() {}
-      return emptyGenerator();
+      return;
     }
 
-    const globbedPaths = pathsToCrawl.map((path) => this.asGlob(path));
+    const remotePaths = pathsToCrawl.filter((crawlPath) => this.remoteStorageRepository.isRemotePath(crawlPath));
+    const localPaths = pathsToCrawl.filter((crawlPath) => !this.remoteStorageRepository.isRemotePath(crawlPath));
 
+    if (remotePaths.length > 0) {
+      for await (const batch of this.remoteStorageRepository.walk(walkOptions)) {
+        yield batch;
+      }
+    }
+
+    if (localPaths.length === 0) {
+      return;
+    }
+
+    const globbedPaths = localPaths.map((crawlPath) => this.asGlob(crawlPath));
     const stream = globStream(globbedPaths, {
       absolute: true,
       caseSensitiveMatch: false,
@@ -267,6 +373,10 @@ export class StorageRepository {
   }
 
   watch(paths: string[], options: ChokidarOptions, events: Partial<WatchEvents>) {
+    if (paths.some((watchPath) => this.remoteStorageRepository.isRemotePath(watchPath))) {
+      throw new Error('Remote external library watching is not supported yet; disable library watching for remote libraries');
+    }
+
     const watcher = chokidar.watch(paths, options);
 
     watcher.on('ready', () => events.onReady?.());
