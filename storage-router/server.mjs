@@ -21,7 +21,14 @@ const nodes = parseNodes();
 let lastAlertLevel = 'normal';
 
 function headers(node, extra = {}) { return { ...(node.token ? { authorization: `Bearer ${node.token}` } : {}), ...extra }; }
-async function request(node, pathname, init = {}) { return fetch(`${node.url}${pathname}`, { ...init, headers: headers(node, init.headers || {}) }); }
+async function request(node, pathname, init = {}) {
+  try {
+    return await fetch(`${node.url}${pathname}`, { ...init, headers: headers(node, init.headers || {}) });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(`${node.name} upstream request failed (${node.url}): ${message}`);
+  }
+}
 async function findFile(relative) {
   const pathname = `/api/file?path=${encodeURIComponent(relative)}`;
   for (const node of nodes) { const response = await request(node, pathname, { method: 'HEAD' }); if (response.ok) return { node, response }; if (response.status !== 404) throw new Error(`${node.name}: ${response.status} ${response.statusText}`); }
@@ -65,9 +72,10 @@ async function monitor() {
 
 const server = http.createServer(async (req, res) => {
   try {
-    if (TOKEN && req.headers.authorization !== `Bearer ${TOKEN}`) return json(res, 401, { error: 'Unauthorized' });
     const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`); const relative = url.searchParams.get('path') || '';
+    // Keep health public so Railway health checks and browser diagnostics work without exposing storage APIs.
     if (req.method === 'GET' && url.pathname === '/health') return json(res, 200, { ok: true, nodes: nodes.length, maxVolumes: 10 });
+    if (TOKEN && req.headers.authorization !== `Bearer ${TOKEN}`) return json(res, 401, { error: 'Unauthorized' });
     if (req.method === 'GET' && url.pathname === '/api/storage') { const statuses = await poolStatus(); return json(res, 200, { totalBytes: statuses.reduce((sum, item) => sum + item.capacityBytes, 0), availableBytes: statuses.reduce((sum, item) => sum + item.availableBytes, 0), freeBytes: statuses.reduce((sum, item) => sum + item.availableBytes, 0), volumes: statuses }); }
     if (req.method === 'GET' && url.pathname === '/api/storage/status') { const statuses = await poolStatus(); return json(res, 200, { volumes: statuses, maxVolumes: 10, warningPercent: WARNING_PERCENT, criticalPercent: CRITICAL_PERCENT, nextVolumeRecommended: nodes.length < 10 && statuses.every((item) => item.usagePercent >= WARNING_PERCENT), volumeLimitReached: nodes.length >= 10 }); }
     if ((req.method === 'GET' || req.method === 'HEAD') && url.pathname === '/api/file') { const found = await findFile(relative); if (!found) return json(res, 404, { error: 'File not found' }); const upstream = await request(found.node, `/api/file?path=${encodeURIComponent(relative)}`, { method: req.method, headers: req.headers.range ? { range: req.headers.range } : {} }); return proxyResponse(res, upstream); }
