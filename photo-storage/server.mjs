@@ -200,4 +200,6 @@ const server = http.createServer(async (req, res) => {
 });
 
 await fs.access(ROOT, constants.R_OK | constants.W_OK);
-server.listen(PORT, '0.0.0.0', () => console.log(`Photo storage listening on ${PORT}, root=${ROOT}`));
+// Railway legacy environments may expose private DNS as IPv6-only.
+// Bind to the IPv6 unspecified address so the service accepts private IPv6 traffic.
+server.listen(PORT, '::', () => console.log(`Photo storage listening on [::]:${PORT}, root=${ROOT}`));
