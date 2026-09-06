@@ -3,6 +3,8 @@ WORKDIR /app
 COPY package.json ./
 COPY server.mjs ./
 COPY selftest.mjs ./
+COPY provisioner.mjs ./
+COPY bootstrap.mjs ./
 ENV NODE_ENV=production
 EXPOSE 8080
-CMD ["node", "server.mjs"]
+CMD ["node", "bootstrap.mjs"]
