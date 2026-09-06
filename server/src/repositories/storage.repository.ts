@@ -184,7 +184,6 @@ export class StorageRepository {
       return this.remoteStorageRepository.readFile(filepath);
     }
 
-    // read a slice
     if (options) {
       const file = await fs.open(filepath);
       try {
@@ -195,7 +194,6 @@ export class StorageRepository {
       }
     }
 
-    // read everything
     return fs.readFile(filepath);
   }
 
@@ -250,7 +248,6 @@ export class StorageRepository {
       throw new Error('Remote external library files are read-only');
     }
 
-    // lstat does not follow symlinks (in contrast to stat)
     const stats = await fs.lstat(directory);
     if (!stats.isDirectory()) {
       return;
@@ -340,7 +337,10 @@ export class StorageRepository {
     const localPaths = pathsToCrawl.filter((crawlPath) => !this.remoteStorageRepository.isRemotePath(crawlPath));
 
     if (remotePaths.length > 0) {
-      for await (const batch of this.remoteStorageRepository.walk(walkOptions)) {
+      for await (const batch of this.remoteStorageRepository.walk({
+        ...walkOptions,
+        pathsToCrawl: remotePaths,
+      })) {
         yield batch;
       }
     }
@@ -388,7 +388,7 @@ export class StorageRepository {
     return () => watcher.close();
   }
 
-  watchDir = watch; // Native fs.watch without chokidar overhead
+  watchDir = watch;
 
   private asGlob(pathToCrawl: string): string {
     const escapedPath = escapePath(pathToCrawl).replaceAll('"', '["]').replaceAll("'", "[']").replaceAll('`', '[`]');
