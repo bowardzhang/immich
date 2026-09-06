@@ -18,9 +18,13 @@ Each Railway service can have only one Volume, so future volumes are represented
 ## API
 
 - `GET /health`
-- `GET /api/list?path=<relative-path>&recursive=false`
+- `GET /api/storage` — real filesystem capacity from `statfs`
+- `GET /api/list?path=<relative-path>&recursive=false|true`
 - `HEAD /api/file?path=<relative-path>`
 - `GET /api/file?path=<relative-path>`
+- `PUT /api/file?path=<relative-path>` — streamed upload through a temporary file and atomic rename
+- `DELETE /api/file?path=<relative-path>`
+- `MOVE /api/file?path=<target>&source=<source>` — same-volume atomic rename
 
 `GET /api/file` supports HTTP Range requests, useful for video playback.
 
