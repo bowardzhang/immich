@@ -22,11 +22,13 @@ let lastAlertLevel = 'normal';
 
 function headers(node, extra = {}) { return { ...(node.token ? { authorization: `Bearer ${node.token}` } : {}), ...extra }; }
 async function request(node, pathname, init = {}) {
+  const target = `${node.url}${pathname}`;
   try {
-    return await fetch(`${node.url}${pathname}`, { ...init, headers: headers(node, init.headers || {}) });
+    return await fetch(target, { ...init, headers: headers(node, init.headers || {}) });
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    throw new Error(`${node.name} upstream request failed (${node.url}): ${message}`);
+    const cause = error?.cause;
+    const details = [error?.message, cause?.code, cause?.message, cause?.address, cause?.port].filter(Boolean).join(' | ');
+    throw new Error(`${node.name} upstream request failed (${target}): ${details || String(error)}`);
   }
 }
 async function findFile(relative) {
@@ -73,7 +75,6 @@ async function monitor() {
 const server = http.createServer(async (req, res) => {
   try {
     const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`); const relative = url.searchParams.get('path') || '';
-    // Keep health public so Railway health checks and browser diagnostics work without exposing storage APIs.
     if (req.method === 'GET' && url.pathname === '/health') return json(res, 200, { ok: true, nodes: nodes.length, maxVolumes: 10 });
     if (TOKEN && req.headers.authorization !== `Bearer ${TOKEN}`) return json(res, 401, { error: 'Unauthorized' });
     if (req.method === 'GET' && url.pathname === '/api/storage') { const statuses = await poolStatus(); return json(res, 200, { totalBytes: statuses.reduce((sum, item) => sum + item.capacityBytes, 0), availableBytes: statuses.reduce((sum, item) => sum + item.availableBytes, 0), freeBytes: statuses.reduce((sum, item) => sum + item.availableBytes, 0), volumes: statuses }); }
