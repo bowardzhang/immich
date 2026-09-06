@@ -5,16 +5,15 @@ const TOKEN = process.env.REMOTE_STORAGE_TOKEN || '';
 const WARNING_PERCENT = Number(process.env.STORAGE_WARNING_PERCENT || 85);
 const CRITICAL_PERCENT = Number(process.env.STORAGE_CRITICAL_PERCENT || 95);
 const CHECK_INTERVAL_MS = Number(process.env.STORAGE_CHECK_INTERVAL_MS || 15 * 60 * 1000);
-const VOLUME_SIZE_BYTES = Number(process.env.VOLUME_SIZE_BYTES || 5 * 1024 ** 3);
 const ALERT_EMAIL_TO = process.env.ALERT_EMAIL_TO || '';
 const RESEND_API_KEY = process.env.RESEND_API_KEY || '';
 const ALERT_EMAIL_FROM = process.env.ALERT_EMAIL_FROM || 'Immich Storage <onboarding@resend.dev>';
 
 function parseNodes() {
   const raw = process.env.STORAGE_NODES || '[]';
-  const nodes = JSON.parse(raw);
-  if (!Array.isArray(nodes) || nodes.length === 0) throw new Error('STORAGE_NODES must contain at least one node');
-  return nodes.map((node, index) => ({
+  const parsed = JSON.parse(raw);
+  if (!Array.isArray(parsed) || parsed.length === 0) throw new Error('STORAGE_NODES must contain at least one node');
+  return parsed.map((node, index) => ({
     name: node.name || `volume-${index + 1}`,
     url: String(node.url).replace(/\/$/, ''),
     token: node.token || TOKEN,
@@ -29,13 +28,16 @@ function headers(node, extra = {}) {
 }
 
 async function request(node, pathname, init = {}) {
-  return fetch(`${node.url}${pathname}`, { ...init, headers: headers(node, init.headers || {}) });
+  return fetch(`${node.url}${pathname}`, {
+    ...init,
+    headers: headers(node, init.headers || {}),
+  });
 }
 
 async function findFile(relative) {
-  const path = `/api/file?path=${encodeURIComponent(relative)}`;
+  const pathname = `/api/file?path=${encodeURIComponent(relative)}`;
   for (const node of nodes) {
-    const response = await request(node, path, { method: 'HEAD' });
+    const response = await request(node, pathname, { method: 'HEAD' });
     if (response.ok) return { node, response };
     if (response.status !== 404) throw new Error(`${node.name}: ${response.status} ${response.statusText}`);
   }
@@ -43,17 +45,49 @@ async function findFile(relative) {
 }
 
 async function getStatus(node) {
-  const response = await request(node, `/api/list?path=&recursive=true`);
+  const response = await request(node, '/api/storage');
   if (!response.ok) throw new Error(`${node.name}: ${response.status} ${response.statusText}`);
   const data = await response.json();
-  const usedBytes = data.entries.reduce((sum, entry) => sum + Number(entry.size || 0), 0);
-  const usagePercent = (usedBytes / VOLUME_SIZE_BYTES) * 100;
-  return { name: node.name, usedBytes, capacityBytes: VOLUME_SIZE_BYTES, usagePercent };
+  const totalBytes = Number(data.totalBytes || 0);
+  const availableBytes = Number(data.availableBytes || data.freeBytes || 0);
+  const usedBytes = Math.max(0, totalBytes - availableBytes);
+  const usagePercent = totalBytes > 0 ? (usedBytes / totalBytes) * 100 : 100;
+  return { name: node.name, usedBytes, availableBytes, capacityBytes: totalBytes, usagePercent };
+}
+
+async function chooseNode(relative) {
+  const existing = await findFile(relative);
+  if (existing) return existing.node;
+
+  const statuses = await Promise.all(nodes.map(async (node) => ({ node, status: await getStatus(node) })));
+  statuses.sort((a, b) => b.status.availableBytes - a.status.availableBytes);
+  const selected = statuses.find(({ status }) => status.availableBytes > 0);
+  if (!selected) throw new Error('All storage volumes are full');
+  return selected.node;
 }
 
 function json(res, status, body) {
   res.writeHead(status, { 'content-type': 'application/json' });
   res.end(JSON.stringify(body));
+}
+
+async function proxyResponse(res, upstream) {
+  res.writeHead(upstream.status, Object.fromEntries(upstream.headers.entries()));
+  if (!upstream.body) {
+    res.end();
+    return;
+  }
+  const reader = upstream.body.getReader();
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!res.write(Buffer.from(value))) await new Promise((resolve) => res.once('drain', resolve));
+    }
+    res.end();
+  } catch (error) {
+    res.destroy(error);
+  }
 }
 
 async function sendAlert(statuses) {
@@ -64,8 +98,10 @@ async function sendAlert(statuses) {
   const subject = level === 'critical'
     ? 'Immich storage is critically full — create the next Railway Volume'
     : 'Immich storage capacity warning — prepare the next Railway Volume';
-  const lines = statuses.map((item) => `${item.name}: ${item.usagePercent.toFixed(1)}% (${Math.round(item.usedBytes / 1024 ** 3)} / 5 GB)`).join('\n');
-  const text = `${subject}\n\n${lines}\n\nPlease create the next 5 GB Railway Volume/Photo Storage service before storage reaches 100%.`;
+  const lines = statuses
+    .map((item) => `${item.name}: ${item.usagePercent.toFixed(1)}% (${(item.usedBytes / 1024 ** 3).toFixed(2)} / ${(item.capacityBytes / 1024 ** 3).toFixed(2)} GiB used)`)
+    .join('\n');
+  const text = `${subject}\n\n${lines}\n\nCreate the next Railway 5 GB Volume and Photo Storage service, then add it to STORAGE_NODES. No automatic provisioning is performed.`;
 
   const response = await fetch('https://api.resend.com/emails', {
     method: 'POST',
@@ -97,6 +133,7 @@ const server = http.createServer(async (req, res) => {
       return;
     }
     const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
+    const relative = url.searchParams.get('path') || '';
 
     if (req.method === 'GET' && url.pathname === '/health') {
       json(res, 200, { ok: true, nodes: nodes.length });
@@ -116,7 +153,6 @@ const server = http.createServer(async (req, res) => {
     }
 
     if ((req.method === 'GET' || req.method === 'HEAD') && url.pathname === '/api/file') {
-      const relative = url.searchParams.get('path') || '';
       const found = await findFile(relative);
       if (!found) {
         json(res, 404, { error: 'File not found' });
@@ -126,35 +162,89 @@ const server = http.createServer(async (req, res) => {
         method: req.method,
         headers: req.headers.range ? { range: req.headers.range } : {},
       });
-      res.writeHead(upstream.status, Object.fromEntries(upstream.headers.entries()));
-      if (req.method === 'HEAD' || !upstream.body) {
-        res.end();
-      } else {
-        const reader = upstream.body.getReader();
-        const pump = async () => {
-          while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            if (!res.write(Buffer.from(value))) await new Promise((resolve) => res.once('drain', resolve));
-          }
-          res.end();
-        };
-        await pump();
+      await proxyResponse(res, upstream);
+      return;
+    }
+
+    if (req.method === 'PUT' && url.pathname === '/api/file') {
+      const node = await chooseNode(relative);
+      const upstream = await request(node, `/api/file?path=${encodeURIComponent(relative)}`, {
+        method: 'PUT',
+        body: req,
+        duplex: 'half',
+        headers: {
+          'content-type': req.headers['content-type'] || 'application/octet-stream',
+          ...(req.headers['content-length'] ? { 'content-length': req.headers['content-length'] } : {}),
+        },
+      });
+      await proxyResponse(res, upstream);
+      return;
+    }
+
+    if (req.method === 'DELETE' && url.pathname === '/api/file') {
+      const found = await findFile(relative);
+      if (!found) {
+        json(res, 404, { error: 'File not found' });
+        return;
       }
+      const upstream = await request(found.node, `/api/file?path=${encodeURIComponent(relative)}`, { method: 'DELETE' });
+      await proxyResponse(res, upstream);
+      return;
+    }
+
+    if (req.method === 'MOVE' && url.pathname === '/api/file') {
+      const source = url.searchParams.get('source') || '';
+      const target = relative;
+      const found = await findFile(source);
+      if (!found) {
+        json(res, 404, { error: 'Source file not found' });
+        return;
+      }
+
+      const targetNode = await chooseNode(target);
+      if (targetNode === found.node) {
+        const upstream = await request(
+          targetNode,
+          `/api/file?path=${encodeURIComponent(target)}&source=${encodeURIComponent(source)}`,
+          { method: 'MOVE' },
+        );
+        await proxyResponse(res, upstream);
+        return;
+      }
+
+      const sourceResponse = await request(found.node, `/api/file?path=${encodeURIComponent(source)}`);
+      if (!sourceResponse.ok || !sourceResponse.body) {
+        throw new Error(`Unable to read source file: ${sourceResponse.status} ${sourceResponse.statusText}`);
+      }
+      const uploadResponse = await request(targetNode, `/api/file?path=${encodeURIComponent(target)}`, {
+        method: 'PUT',
+        body: sourceResponse.body,
+        duplex: 'half',
+        headers: {
+          'content-type': sourceResponse.headers.get('content-type') || 'application/octet-stream',
+          ...(sourceResponse.headers.get('content-length') ? { 'content-length': sourceResponse.headers.get('content-length') } : {}),
+        },
+      });
+      if (!uploadResponse.ok) {
+        throw new Error(`Unable to write target file: ${uploadResponse.status} ${uploadResponse.statusText}`);
+      }
+
+      const deleteResponse = await request(found.node, `/api/file?path=${encodeURIComponent(source)}`, { method: 'DELETE' });
+      if (!deleteResponse.ok) {
+        throw new Error(`Target written but source deletion failed: ${deleteResponse.status} ${deleteResponse.statusText}`);
+      }
+      json(res, 200, { source, path: target });
       return;
     }
 
     if (req.method === 'GET' && url.pathname === '/api/list') {
-      const relative = url.searchParams.get('path') || '';
       const recursive = url.searchParams.get('recursive') === 'true';
       const merged = new Map();
       for (const node of nodes) {
         const upstream = await request(node, `/api/list?path=${encodeURIComponent(relative)}&recursive=${recursive}`);
         if (!upstream.ok) continue;
         const data = await upstream.json();
-        for (const entry of data.entries || []) {
-          merged.set(entry.path, entry);
-        }
+        for (const entry of data.entries || []) merged.set(entry.path, entry);
       }
       json(res, 200, { entries: [...merged.values()] });
       return;
