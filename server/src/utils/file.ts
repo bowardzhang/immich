@@ -67,7 +67,11 @@ const sendRemoteFile = async (res: Response, path: string): Promise<void> => {
     if (value) res.set(header, value);
   }
 
-  if (!response.body) return res.end();
+  if (!response.body) {
+    res.end();
+    return;
+  }
+
   const reader = response.body.getReader();
   try {
     while (true) {
@@ -106,11 +110,12 @@ export const sendFile = async (
     }
 
     if (file.path === REMOTE_MEDIA_PREFIX || file.path.startsWith(`${REMOTE_MEDIA_PREFIX}/`)) {
-      return await sendRemoteFile(res, file.path);
+      await sendRemoteFile(res, file.path);
+      return;
     }
 
     await access(file.path, constants.R_OK);
-    return await _sendFile(file.path, { dotfiles: 'allow' });
+    await _sendFile(file.path, { dotfiles: 'allow' });
   } catch (error: Error | any) {
     // ignore client-closed connection
     if (isConnectionAborted(error) || res.headersSent) {
