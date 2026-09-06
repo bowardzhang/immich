@@ -12,15 +12,12 @@ RUN npm install --global corepack@latest && \
 FROM builder AS server
 
 WORKDIR /usr/src/app
+COPY package.json .pnpmfile.cjs pnpm-lock.yaml pnpm-workspace.yaml ./
 COPY ./server ./server/
 COPY ./packages/sdk ./packages/sdk/
 COPY ./packages/plugin-sdk ./packages/plugin-sdk/
-RUN --mount=type=bind,source=package.json,target=package.json \
-  --mount=type=bind,source=.pnpmfile.cjs,target=.pnpmfile.cjs \
-  --mount=type=bind,source=pnpm-lock.yaml,target=pnpm-lock.yaml \
-  --mount=type=bind,source=pnpm-workspace.yaml,target=pnpm-workspace.yaml \
-  SHARP_IGNORE_GLOBAL_LIBVIPS=true pnpm --filter @immich/sdk --filter @immich/plugin-sdk --filter immich build && \
-  SHARP_FORCE_GLOBAL_LIBVIPS=true  pnpm --filter immich --prod --no-optional deploy /output/server-pruned
+RUN SHARP_IGNORE_GLOBAL_LIBVIPS=true pnpm --filter @immich/sdk --filter @immich/plugin-sdk --filter immich build && \
+  SHARP_FORCE_GLOBAL_LIBVIPS=true pnpm --filter immich --prod --no-optional deploy /output/server-pruned
 
 FROM builder AS web
 
@@ -28,24 +25,19 @@ ARG BUILD_ID
 ENV IMMICH_BUILD=${BUILD_ID}
 
 WORKDIR /usr/src/app
+COPY package.json .pnpmfile.cjs pnpm-lock.yaml pnpm-workspace.yaml ./
 COPY ./web ./web/
 COPY ./i18n ./i18n/
 COPY ./packages ./packages/
-RUN --mount=type=bind,source=package.json,target=package.json \
-  --mount=type=bind,source=.pnpmfile.cjs,target=.pnpmfile.cjs \
-  --mount=type=bind,source=pnpm-lock.yaml,target=pnpm-lock.yaml \
-  --mount=type=bind,source=pnpm-workspace.yaml,target=pnpm-workspace.yaml \
-  SHARP_IGNORE_GLOBAL_LIBVIPS=true pnpm --filter @immich/sdk --filter immich-web install --frozen-lockfile --force && \
+RUN SHARP_IGNORE_GLOBAL_LIBVIPS=true pnpm --filter @immich/sdk --filter immich-web install --frozen-lockfile --force && \
   pnpm --filter @immich/sdk --filter immich-web build
 
 FROM builder AS cli
 
+WORKDIR /usr/src/app
+COPY package.json .pnpmfile.cjs pnpm-lock.yaml pnpm-workspace.yaml ./
 COPY ./packages ./packages/
-RUN --mount=type=bind,source=package.json,target=package.json \
-  --mount=type=bind,source=.pnpmfile.cjs,target=.pnpmfile.cjs \
-  --mount=type=bind,source=pnpm-lock.yaml,target=pnpm-lock.yaml \
-  --mount=type=bind,source=pnpm-workspace.yaml,target=pnpm-workspace.yaml \
-  pnpm --filter @immich/sdk --filter @immich/cli install --frozen-lockfile && \
+RUN pnpm --filter @immich/sdk --filter @immich/cli install --frozen-lockfile && \
   pnpm --filter @immich/sdk --filter @immich/cli build && \
   pnpm --filter @immich/cli --prod --no-optional deploy /output/cli-pruned
 
@@ -56,6 +48,7 @@ ARG TARGETPLATFORM
 COPY --from=ghcr.io/jdx/mise:2026.7.11@sha256:6599c81b0da6206cbf5151df97a36794d70aaec4574ceb92d13783b42080b055 /usr/local/bin/mise /usr/local/bin/mise
 
 WORKDIR /app
+COPY package.json .pnpmfile.cjs pnpm-lock.yaml pnpm-workspace.yaml ./
 COPY ./mise.toml ./mise.toml
 COPY ./packages/plugin-core/mise.toml ./packages/plugin-core/
 ENV MISE_TRUSTED_CONFIG_PATHS=/app/mise.toml
@@ -68,11 +61,7 @@ COPY ./packages/plugin-core ./packages/plugin-core/
 COPY ./packages/plugin-sdk ./packages/plugin-sdk/
 
 # Build plugins
-RUN --mount=type=bind,source=package.json,target=package.json \
-  --mount=type=bind,source=.pnpmfile.cjs,target=.pnpmfile.cjs \
-  --mount=type=bind,source=pnpm-lock.yaml,target=pnpm-lock.yaml \
-  --mount=type=bind,source=pnpm-workspace.yaml,target=pnpm-workspace.yaml \
-  mise //:plugins
+RUN mise //:plugins
 
 FROM ghcr.io/immich-app/base-server-prod:202607211135@sha256:ced131da7523544fe975cfd25abd67386e712e39496340b437cd95a08d0a18f3
 
