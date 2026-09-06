@@ -1,7 +1,8 @@
 import http from 'node:http';
 import path from 'node:path';
-import { constants } from 'node:fs';
+import { constants, createReadStream, createWriteStream } from 'node:fs';
 import fs from 'node:fs/promises';
+import { pipeline } from 'node:stream/promises';
 
 const ROOT = path.resolve(process.env.PHOTO_STORAGE_ROOT || '/photos_extern');
 const PORT = Number(process.env.PORT || 8080);
@@ -67,15 +68,9 @@ async function listRecursive(relative) {
     for (const entry of entries) {
       const child = path.join(current, entry.name);
       const stat = await fs.stat(child);
-      if (entry.isDirectory()) {
-        stack.push(child);
-      } else if (entry.isFile()) {
-        results.push({
-          path: relativePath(child),
-          type: 'file',
-          size: stat.size,
-          mtime: stat.mtime.toISOString(),
-        });
+      if (entry.isDirectory()) stack.push(child);
+      else if (entry.isFile()) {
+        results.push({ path: relativePath(child), type: 'file', size: stat.size, mtime: stat.mtime.toISOString() });
       }
     }
   }
@@ -84,6 +79,11 @@ async function listRecursive(relative) {
 
 function parsePath(url) {
   return url.searchParams.get('path') || '';
+}
+
+function sendJson(res, status, body) {
+  res.writeHead(status, { 'content-type': 'application/json' });
+  res.end(JSON.stringify(body));
 }
 
 const server = http.createServer(async (req, res) => {
@@ -97,8 +97,46 @@ const server = http.createServer(async (req, res) => {
     const relative = parsePath(url);
 
     if (req.method === 'GET' && url.pathname === '/health') {
-      res.writeHead(200, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({ ok: true }));
+      sendJson(res, 200, { ok: true });
+      return;
+    }
+
+    if (req.method === 'GET' && url.pathname === '/api/storage') {
+      const stats = await fs.statfs(ROOT);
+      sendJson(res, 200, {
+        totalBytes: stats.blocks * stats.bsize,
+        freeBytes: stats.bfree * stats.bsize,
+        availableBytes: stats.bavail * stats.bsize,
+      });
+      return;
+    }
+
+    if (req.method === 'PUT' && url.pathname === '/api/file') {
+      const file = safePath(relative);
+      await fs.mkdir(path.dirname(file), { recursive: true });
+      const temp = `${file}.upload-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      try {
+        await pipeline(req, createWriteStream(temp, { flags: 'wx' }));
+        await fs.rename(temp, file);
+      } finally {
+        await fs.rm(temp, { force: true });
+      }
+      sendJson(res, 201, { path: relativePath(file) });
+      return;
+    }
+
+    if (req.method === 'DELETE' && url.pathname === '/api/file') {
+      await fs.unlink(safePath(relative));
+      sendJson(res, 200, { deleted: relative });
+      return;
+    }
+
+    if (req.method === 'MOVE' && url.pathname === '/api/file') {
+      const source = safePath(url.searchParams.get('source') || '');
+      const target = safePath(relative);
+      await fs.mkdir(path.dirname(target), { recursive: true });
+      await fs.rename(source, target);
+      sendJson(res, 200, { source: url.searchParams.get('source'), path: relative });
       return;
     }
 
@@ -137,40 +175,29 @@ const server = http.createServer(async (req, res) => {
           headers['content-range'] = `bytes ${start}-${end}/${stat.size}`;
           headers['accept-ranges'] = 'bytes';
           res.writeHead(206, headers);
-          const stream = (await import('node:fs')).createReadStream(file, { start, end });
-          stream.pipe(res);
+          createReadStream(file, { start, end }).pipe(res);
           return;
         }
       }
 
       res.writeHead(200, headers);
-      const stream = (await import('node:fs')).createReadStream(file);
-      stream.on('error', (error) => {
-        if (!res.headersSent) res.writeHead(500);
-        res.destroy(error);
-      });
-      stream.pipe(res);
+      createReadStream(file).pipe(res);
       return;
     }
 
     if (req.method === 'GET' && url.pathname === '/api/list') {
       const recursive = url.searchParams.get('recursive') === 'true';
       const entries = recursive ? await listRecursive(relative) : await listImmediate(relative);
-      res.writeHead(200, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({ entries }));
+      sendJson(res, 200, { entries });
       return;
     }
 
-    res.writeHead(404, { 'content-type': 'application/json' });
-    res.end(JSON.stringify({ error: 'Not found' }));
+    sendJson(res, 404, { error: 'Not found' });
   } catch (error) {
     const code = error?.code === 'ENOENT' ? 404 : error?.code === 'EACCES' ? 403 : 400;
-    res.writeHead(code, { 'content-type': 'application/json' });
-    res.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }));
+    sendJson(res, code, { error: error instanceof Error ? error.message : String(error) });
   }
 });
 
-await fs.access(ROOT, constants.R_OK);
-server.listen(PORT, '0.0.0.0', () => {
-  console.log(`Photo storage listening on ${PORT}, root=${ROOT}`);
-});
+await fs.access(ROOT, constants.R_OK | constants.W_OK);
+server.listen(PORT, '0.0.0.0', () => console.log(`Photo storage listening on ${PORT}, root=${ROOT}`));
