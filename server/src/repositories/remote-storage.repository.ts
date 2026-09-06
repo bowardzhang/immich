@@ -1,11 +1,13 @@
 import { Injectable } from '@nestjs/common';
-import { constants } from 'node:fs';
-import { Readable } from 'node:stream';
-import { Stats } from 'node:fs';
+import { constants, createReadStream, createWriteStream } from 'node:fs';
+import fs from 'node:fs/promises';
+import os from 'node:os';
 import path from 'node:path';
+import { Readable, Writable } from 'node:stream';
 import picomatch from 'picomatch';
 import { CrawlOptionsDto, WalkOptionsDto } from 'src/dtos/library.dto';
 import { mimeTypes } from 'src/utils/mime-types';
+import { Stats } from 'node:fs';
 
 interface RemoteEntry {
   path: string;
@@ -24,17 +26,6 @@ export interface RemoteReadStream {
   length?: number;
 }
 
-/**
- * Read-only HTTP adapter for a Railway private-network photo service.
- *
- * Remote paths use the form:
- *   /remote/photo-extern/<relative path>
- *
- * The remote service exposes:
- *   GET  /api/list?path=<relative path>&recursive=true
- *   HEAD /api/file?path=<relative path>
- *   GET  /api/file?path=<relative path>
- */
 @Injectable()
 export class RemoteStorageRepository {
   private readonly prefix = '/remote/photo-extern';
@@ -51,30 +42,19 @@ export class RemoteStorageRepository {
   }
 
   private relativePath(filepath: string): string {
-    if (!this.isRemotePath(filepath)) {
-      throw new Error(`Not a remote path: ${filepath}`);
-    }
-
+    if (!this.isRemotePath(filepath)) throw new Error(`Not a remote path: ${filepath}`);
     const relative = filepath.slice(this.prefix.length).replace(/^\/+/, '');
     const normalized = path.posix.normalize(`/${relative}`).replace(/^\/+/, '');
-    if (!relative && normalized) {
-      throw new Error(`Invalid remote path: ${filepath}`);
-    }
-    if (normalized === '..' || normalized.startsWith('../')) {
-      throw new Error(`Path traversal is not allowed: ${filepath}`);
-    }
+    if (normalized === '..' || normalized.startsWith('../')) throw new Error(`Path traversal is not allowed: ${filepath}`);
     return normalized;
   }
 
-  private buildUrl(endpoint: 'list' | 'file', relativePath: string, recursive = false): URL {
-    if (!this.baseUrl) {
-      throw new Error('REMOTE_STORAGE_URL is not configured');
-    }
-
+  private buildUrl(endpoint: 'list' | 'file' | 'storage', relativePath: string, recursive = false): URL {
+    if (!this.baseUrl) throw new Error('REMOTE_STORAGE_URL is not configured');
     const url = new URL(`/api/${endpoint}`, this.baseUrl);
-    url.searchParams.set('path', relativePath);
-    if (endpoint === 'list') {
-      url.searchParams.set('recursive', String(recursive));
+    if (endpoint !== 'storage') {
+      url.searchParams.set('path', relativePath);
+      if (endpoint === 'list') url.searchParams.set('recursive', String(recursive));
     }
     return url;
   }
@@ -96,90 +76,59 @@ export class RemoteStorageRepository {
     return response;
   }
 
+  private async uploadFile(localPath: string, remotePath: string) {
+    const relative = this.relativePath(remotePath);
+    const stat = await fs.stat(localPath);
+    const response = await this.request(this.buildUrl('file', relative), {
+      method: 'PUT',
+      body: createReadStream(localPath),
+      duplex: 'half',
+      headers: { 'content-length': String(stat.size), 'content-type': mimeTypes.getMimeType(localPath) || 'application/octet-stream' },
+    });
+    await response.arrayBuffer();
+  }
+
   async stat(filepath: string): Promise<Stats> {
     const relative = this.relativePath(filepath);
-    const url = this.buildUrl('file', relative);
-    const response = await this.request(url, { method: 'HEAD' });
+    const response = await this.request(this.buildUrl('file', relative), { method: 'HEAD' });
     const size = Number(response.headers.get('content-length') || 0);
     const modified = response.headers.get('last-modified');
     const mtime = modified ? new Date(modified) : new Date(0);
     const isDirectory = response.headers.get('x-remote-type') === 'directory';
-
     return {
-      size,
-      mtime,
-      mtimeMs: mtime.getTime(),
-      ctime: mtime,
-      ctimeMs: mtime.getTime(),
-      birthtime: mtime,
-      birthtimeMs: mtime.getTime(),
-      atime: mtime,
-      atimeMs: mtime.getTime(),
-      dev: 0,
-      ino: 0,
-      mode: isDirectory ? 0o755 : 0o644,
-      nlink: 1,
-      uid: 0,
-      gid: 0,
-      rdev: 0,
-      blksize: 4096,
+      size, mtime, mtimeMs: mtime.getTime(), ctime: mtime, ctimeMs: mtime.getTime(), birthtime: mtime,
+      birthtimeMs: mtime.getTime(), atime: mtime, atimeMs: mtime.getTime(), dev: 0, ino: 0,
+      mode: isDirectory ? 0o755 : 0o644, nlink: 1, uid: 0, gid: 0, rdev: 0, blksize: 4096,
       blocks: Math.ceil(size / 512),
-      isDirectory: () => isDirectory,
-      isFile: () => !isDirectory,
-      isBlockDevice: () => false,
-      isCharacterDevice: () => false,
-      isSymbolicLink: () => false,
-      isFIFO: () => false,
-      isSocket: () => false,
+      isDirectory: () => isDirectory, isFile: () => !isDirectory, isBlockDevice: () => false,
+      isCharacterDevice: () => false, isSymbolicLink: () => false, isFIFO: () => false, isSocket: () => false,
     } as Stats;
   }
 
   async checkFileExists(filepath: string, mode = constants.F_OK): Promise<boolean> {
-    if (mode !== constants.F_OK && mode !== constants.R_OK) {
-      return false;
-    }
-    try {
-      await this.stat(filepath);
-      return true;
-    } catch {
-      return false;
-    }
+    if (mode !== constants.F_OK && mode !== constants.R_OK && mode !== constants.W_OK) return false;
+    try { await this.stat(filepath); return true; } catch { return false; }
   }
 
   async readdir(filepath: string): Promise<string[]> {
-    const relative = this.relativePath(filepath);
-    const url = this.buildUrl('list', relative, false);
-    const response = await this.request(url);
-    const result = (await response.json()) as RemoteListResponse;
-    return result.entries.map((entry) => path.posix.basename(entry.path));
+    const result = (await this.request(this.buildUrl('list', this.relativePath(filepath), false))).json() as Promise<RemoteListResponse>;
+    return (await result).entries.map((entry) => path.posix.basename(entry.path));
   }
 
   async readdirWithTypes(filepath: string) {
-    const relative = this.relativePath(filepath);
-    const url = this.buildUrl('list', relative, false);
-    const response = await this.request(url);
+    const response = await this.request(this.buildUrl('list', this.relativePath(filepath), false));
     const result = (await response.json()) as RemoteListResponse;
-
     return result.entries.map((entry) => ({
       name: path.posix.basename(entry.path),
-      isDirectory: () => entry.type === 'directory',
-      isFile: () => entry.type === 'file',
-      isBlockDevice: () => false,
-      isCharacterDevice: () => false,
-      isSymbolicLink: () => false,
-      isFIFO: () => false,
-      isSocket: () => false,
+      isDirectory: () => entry.type === 'directory', isFile: () => entry.type === 'file',
+      isBlockDevice: () => false, isCharacterDevice: () => false, isSymbolicLink: () => false,
+      isFIFO: () => false, isSocket: () => false,
     }));
   }
 
   async createReadStream(filepath: string, mimeType?: string | null): Promise<RemoteReadStream> {
-    const relative = this.relativePath(filepath);
-    const url = this.buildUrl('file', relative);
-    const response = await this.request(url);
-    if (!response.body) {
-      throw new Error(`Remote storage returned an empty response for ${filepath}`);
-    }
-
+    const response = await this.request(this.buildUrl('file', this.relativePath(filepath)));
+    if (!response.body) throw new Error(`Remote storage returned an empty response for ${filepath}`);
     return {
       stream: Readable.fromWeb(response.body as import('node:stream/web').ReadableStream),
       length: Number(response.headers.get('content-length') || 0) || undefined,
@@ -188,69 +137,116 @@ export class RemoteStorageRepository {
   }
 
   async createPlainReadStream(filepath: string): Promise<Readable> {
-    const result = await this.createReadStream(filepath);
-    return result.stream;
+    return (await this.createReadStream(filepath)).stream;
   }
 
   async readFile(filepath: string): Promise<Buffer> {
-    const relative = this.relativePath(filepath);
-    const url = this.buildUrl('file', relative);
-    const response = await this.request(url);
+    const response = await this.request(this.buildUrl('file', this.relativePath(filepath)));
     return Buffer.from(await response.arrayBuffer());
+  }
+
+  async createFile(filepath: string, buffer: Buffer) {
+    const relative = this.relativePath(filepath);
+    await this.request(this.buildUrl('file', relative), {
+      method: 'PUT',
+      body: buffer,
+      headers: { 'content-length': String(buffer.length), 'content-type': 'application/octet-stream' },
+    });
+  }
+
+  async createWriteStream(filepath: string): Promise<Writable> {
+    const relative = this.relativePath(filepath);
+    const temp = path.join(os.tmpdir(), `immich-remote-${Date.now()}-${Math.random().toString(36).slice(2)}.tmp`);
+    const local = createWriteStream(temp, { flags: 'wx' });
+    return new Writable({
+      write(chunk, encoding, callback) {
+        if (!local.write(chunk, encoding)) local.once('drain', callback);
+        else callback();
+      },
+      final: (callback) => {
+        local.end(async () => {
+          try {
+            await this.uploadFile(temp, `${this.prefix}/${relative}`);
+            callback();
+          } catch (error) {
+            callback(error as Error);
+          } finally {
+            await fs.rm(temp, { force: true });
+          }
+        });
+      },
+      destroy: (_error, callback) => {
+        local.destroy();
+        void fs.rm(temp, { force: true }).then(() => callback()).catch(callback);
+      },
+    });
+  }
+
+  async createOrOverwriteFile(filepath: string, buffer: Buffer) {
+    return this.createFile(filepath, buffer);
+  }
+
+  async overwriteFile(filepath: string, buffer: Buffer) {
+    return this.createFile(filepath, buffer);
+  }
+
+  async rename(source: string, target: string) {
+    const sourceRelative = this.relativePath(source);
+    const targetRelative = this.relativePath(target);
+    await this.request(this.buildUrl('file', targetRelative), {
+      method: 'MOVE',
+      headers: { 'x-source-path': sourceRelative },
+    });
+  }
+
+  async unlink(filepath: string) {
+    await this.request(this.buildUrl('file', this.relativePath(filepath)), { method: 'DELETE' });
+  }
+
+  async utimes(_filepath: string, _atime: Date, _mtime: Date) {
+    // Remote storage currently preserves the service filesystem mtime; Immich does not require this for media access.
+  }
+
+  async copyFile(source: string, target: string) {
+    const sourceRelative = this.relativePath(source);
+    const targetRelative = this.relativePath(target);
+    const response = await this.request(this.buildUrl('file', sourceRelative));
+    if (!response.body) throw new Error(`Remote storage returned an empty response for ${source}`);
+    await this.request(this.buildUrl('file', targetRelative), {
+      method: 'PUT',
+      body: response.body,
+      duplex: 'half',
+      headers: { 'content-type': response.headers.get('content-type') || 'application/octet-stream' },
+    });
   }
 
   async *walk(walkOptions: WalkOptionsDto): AsyncGenerator<string[]> {
     const { pathsToCrawl, exclusionPatterns, includeHidden, take } = walkOptions;
-    if (pathsToCrawl.length === 0) {
-      return;
-    }
-
+    if (pathsToCrawl.length === 0) return;
     const matcher = picomatch(exclusionPatterns);
     const extensions = mimeTypes.getSupportedFileExtensions().map((extension) => extension.toLowerCase());
     let batch: string[] = [];
-
     for (const root of pathsToCrawl) {
       const relativeRoot = this.relativePath(root);
-      const url = this.buildUrl('list', relativeRoot, true);
-      const response = await this.request(url);
+      const response = await this.request(this.buildUrl('list', relativeRoot, true));
       const result = (await response.json()) as RemoteListResponse;
-
       for (const entry of result.entries) {
-        if (entry.type !== 'file') {
-          continue;
-        }
-
+        if (entry.type !== 'file') continue;
         const remotePath = `${this.prefix}/${entry.path}`;
         const filename = path.posix.basename(entry.path);
-        const extension = path.posix.extname(filename).toLowerCase();
-        if (!extensions.includes(extension)) {
-          continue;
-        }
-        if (!includeHidden && filename.startsWith('.')) {
-          continue;
-        }
-        if (matcher(remotePath) || matcher(entry.path)) {
-          continue;
-        }
-
+        if (!extensions.includes(path.posix.extname(filename).toLowerCase())) continue;
+        if (!includeHidden && filename.startsWith('.')) continue;
+        if (matcher(remotePath) || matcher(entry.path)) continue;
         batch.push(remotePath);
-        if (batch.length >= take) {
-          yield batch;
-          batch = [];
-        }
+        if (batch.length >= take) { yield batch; batch = []; }
       }
     }
-
-    if (batch.length > 0) {
-      yield batch;
-    }
+    if (batch.length > 0) yield batch;
   }
 
   async crawl(crawlOptions: CrawlOptionsDto): Promise<string[]> {
     const paths: string[] = [];
-    for await (const batch of this.walk({ ...crawlOptions, take: Number.MAX_SAFE_INTEGER })) {
-      paths.push(...batch);
-    }
+    for await (const batch of this.walk({ ...crawlOptions, take: Number.MAX_SAFE_INTEGER })) paths.push(...batch);
     return paths;
   }
 
