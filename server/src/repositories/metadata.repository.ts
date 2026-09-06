@@ -1,7 +1,11 @@
 import { Injectable } from '@nestjs/common';
 import { BinaryField, DefaultReadTaskOptions, ExifTool, ReadTaskOptions, Tags } from 'exiftool-vendored';
 import geotz from 'geo-tz';
+import fs from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
 import { LoggingRepository } from 'src/repositories/logging.repository';
+import { RemoteStorageRepository } from 'src/repositories/remote-storage.repository';
 import { mimeTypes } from 'src/utils/mime-types';
 
 interface ExifDuration {
@@ -94,7 +98,10 @@ export class MetadataRepository {
     taskTimeoutMillis: 2 * 60 * 1000,
   });
 
-  constructor(private logger: LoggingRepository) {
+  constructor(
+    private logger: LoggingRepository,
+    private remoteStorageRepository: RemoteStorageRepository,
+  ) {
     this.logger.setContext(MetadataRepository.name);
   }
 
@@ -106,17 +113,35 @@ export class MetadataRepository {
     await this.exiftool.end();
   }
 
+  private async withLocalPath<T>(filePath: string, operation: (localPath: string) => Promise<T>, writeBack = false): Promise<T> {
+    if (!this.remoteStorageRepository.isRemotePath(filePath)) return operation(filePath);
+
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'immich-remote-metadata-'));
+    const localPath = path.join(tempDir, path.basename(filePath) || 'media');
+    try {
+      const buffer = await this.remoteStorageRepository.readFile(filePath);
+      await fs.writeFile(localPath, buffer);
+      const result = await operation(localPath);
+      if (writeBack) {
+        await this.remoteStorageRepository.createFile(filePath, await fs.readFile(localPath));
+      }
+      return result;
+    } finally {
+      await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
+    }
+  }
+
   readTags(path: string): Promise<ImmichTags> {
     const options: ReadTaskOptions | undefined = mimeTypes.isVideo(path) ? { readArgs: ['-ee'] } : undefined;
 
-    return this.exiftool.read(path, options).catch((error) => {
+    return this.withLocalPath(path, (localPath) => this.exiftool.read(localPath, options)).catch((error) => {
       this.logger.warn(`Error reading exif data (${path}): ${error}\n${error?.stack}`);
       return {};
     }) as Promise<ImmichTags>;
   }
 
   extractBinaryTag(path: string, tagName: string): Promise<Buffer> {
-    return this.exiftool.extractBinaryTagToBuffer(tagName, path);
+    return this.withLocalPath(path, (localPath) => this.exiftool.extractBinaryTagToBuffer(tagName, localPath));
   }
 
   async writeTags(path: string, tags: Partial<Tags>): Promise<void> {
@@ -125,7 +150,7 @@ export class MetadataRepository {
     // https://exiftool.org/exiftool_pod.html#:~:text=is%20used%20to%20write%20an%20empty%20string
     const tagsToWrite = Object.fromEntries(Object.entries(tags).map(([key, value]) => [`${key}^`, value]));
     try {
-      await this.exiftool.write(path, tagsToWrite);
+      await this.withLocalPath(path, (localPath) => this.exiftool.write(localPath, tagsToWrite), true);
     } catch (error) {
       this.logger.warn(`Error writing exif data (${path}): ${error}`);
     }
