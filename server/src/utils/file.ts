@@ -8,6 +8,8 @@ import { LoggingRepository } from 'src/repositories/logging.repository';
 import { ImmichReadStream } from 'src/repositories/storage.repository';
 import { isConnectionAborted } from 'src/utils/misc';
 
+const REMOTE_MEDIA_PREFIX = '/remote/photo-extern';
+
 export function getFileNameWithoutExtension(path: string): string {
   return basename(path, getFilenameExtension(path));
 }
@@ -44,6 +46,41 @@ const cacheControlHeaders: Record<CacheControl, string | null> = {
   [CacheControl.None]: null, // falsy value to prevent adding Cache-Control header
 };
 
+const sendRemoteFile = async (res: Response, path: string): Promise<void> => {
+  const baseUrl = (process.env.REMOTE_STORAGE_URL || '').replace(/\/$/, '');
+  const token = process.env.REMOTE_STORAGE_TOKEN || '';
+  if (!baseUrl) throw new Error('REMOTE_STORAGE_URL is not configured');
+
+  const relative = path.slice(REMOTE_MEDIA_PREFIX.length).replace(/^\/+/, '');
+  const encodedPath = encodeURIComponent(relative);
+  const range = res.req.headers.range;
+  const headers: Record<string, string> = {};
+  if (token) headers.authorization = `Bearer ${token}`;
+  if (range) headers.range = range;
+
+  const response = await fetch(`${baseUrl}/api/file?path=${encodedPath}`, { headers });
+  if (!response.ok) throw new Error(`Remote media request failed: ${response.status} ${response.statusText}`);
+
+  res.status(response.status);
+  for (const header of ['content-type', 'content-length', 'content-range', 'accept-ranges', 'etag', 'last-modified']) {
+    const value = response.headers.get(header);
+    if (value) res.set(header, value);
+  }
+
+  if (!response.body) return res.end();
+  const reader = response.body.getReader();
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!res.write(Buffer.from(value))) await new Promise((resolve) => res.once('drain', resolve));
+    }
+    res.end();
+  } catch (error) {
+    res.destroy(error as Error);
+  }
+};
+
 export const sendFile = async (
   res: Response,
   next: NextFunction,
@@ -57,8 +94,6 @@ export const sendFile = async (
   try {
     const file = await handler();
 
-    await access(file.path, constants.R_OK);
-
     const cacheControlHeader = cacheControlHeaders[file.cacheControl];
     if (cacheControlHeader) {
       // set the header to Cache-Control
@@ -70,6 +105,11 @@ export const sendFile = async (
       res.header('Content-Disposition', `inline; filename*=UTF-8''${encodeURIComponent(file.fileName)}`);
     }
 
+    if (file.path === REMOTE_MEDIA_PREFIX || file.path.startsWith(`${REMOTE_MEDIA_PREFIX}/`)) {
+      return await sendRemoteFile(res, file.path);
+    }
+
+    await access(file.path, constants.R_OK);
     return await _sendFile(file.path, { dotfiles: 'allow' });
   } catch (error: Error | any) {
     // ignore client-closed connection
