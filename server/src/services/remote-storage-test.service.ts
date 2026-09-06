@@ -125,7 +125,7 @@ export class RemoteStorageTestService {
       const directPreview = `/remote/photo-extern/.immich-router-canary/${imageId}-preview.jpeg`;
       await this.mediaRepository.generateThumbnail(
         imagePath,
-        { format: 'jpeg', quality: 80, colorspace: 'srgb', processInvalidImages: false },
+        { format: 'jpeg' as any, quality: 80, colorspace: 'srgb', processInvalidImages: false },
         directPreview,
       );
       const previewStat = await this.storageRepository.stat(directPreview);
