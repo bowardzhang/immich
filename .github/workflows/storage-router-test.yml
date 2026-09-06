@@ -1,0 +1,25 @@
+name: Storage Router Integration Test
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'storage-router/**'
+      - 'photo-storage/**'
+      - 'server/src/repositories/remote-storage.repository.ts'
+      - '.github/workflows/storage-router-test.yml'
+
+jobs:
+  integration-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      REMOTE_STORAGE_TOKEN: ${{ secrets.REMOTE_STORAGE_TOKEN }}
+      STORAGE_ROUTER_URL: https://storage-router-production.up.railway.app
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run Storage Router lifecycle test
+        shell: pwsh
+        run: ./storage-router/test-storage.ps1
