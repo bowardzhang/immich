@@ -12,6 +12,7 @@ import { RemoteStorageRepository } from 'src/repositories/remote-storage.reposit
 import { StorageRepository } from 'src/repositories/storage.repository';
 import { LoggingRepository } from 'src/repositories/logging.repository';
 import { UserRepository } from 'src/repositories/user.repository';
+import { MediaRepository } from 'src/repositories/media.repository';
 import { AssetMediaService } from 'src/services/asset-media.service';
 import { AssetMediaCreateDto } from 'src/dtos/asset-media.dto';
 
@@ -25,6 +26,7 @@ export class RemoteStorageTestService {
     private assetMediaService: AssetMediaService,
     private userRepository: UserRepository,
     private configRepository: ConfigRepository,
+    private mediaRepository: MediaRepository,
     private logger: LoggingRepository,
   ) {
     this.logger.setContext(RemoteStorageTestService.name);
@@ -101,7 +103,7 @@ export class RemoteStorageTestService {
 
     try {
       const imageBuffer = await sharp({
-        create: { width: 64, height: 48, channels: 3, background: { r: 80, g: 120, b: 160 } },
+        create: { width: 64, height: 48, channels: 3, background: { r: Math.floor(Math.random() * 255), g: 120, b: 160 } },
       })
         .jpeg({ quality: 85 })
         .toBuffer();
@@ -119,6 +121,16 @@ export class RemoteStorageTestService {
         this.makeUploadFile(imagePath, imageBuffer, 'remote-canary-image.jpg', imageId),
       );
       this.logger.log(`Remote real image upload PASS: ${imageResult.id} (${imageResult.status})`);
+
+      const directPreview = `/remote/photo-extern/.immich-router-canary/${imageId}-preview.jpeg`;
+      await this.mediaRepository.generateThumbnail(
+        imagePath,
+        { format: 'jpeg', quality: 80, colorspace: 'srgb', processInvalidImages: false },
+        directPreview,
+      );
+      const previewStat = await this.storageRepository.stat(directPreview);
+      if (previewStat.size <= 0) throw new Error('remote thumbnail was empty');
+      this.logger.log(`Remote staged thumbnail PASS: ${directPreview} (${previewStat.size} bytes)`);
 
       await execFileAsync('ffmpeg', [
         '-hide_banner', '-loglevel', 'error',
@@ -141,6 +153,12 @@ export class RemoteStorageTestService {
         this.makeUploadFile(videoPath, videoBuffer, 'remote-canary-video.mp4', videoId),
       );
       this.logger.log(`Remote real video upload PASS: ${videoResult.id} (${videoResult.status})`);
+
+      const probe = await this.mediaRepository.probe(videoPath);
+      if (probe.videoStreams.length === 0 || probe.format.duration <= 0) {
+        throw new Error('remote video probe returned no valid video stream');
+      }
+      this.logger.log(`Remote video probe PASS: ${probe.format.duration.toFixed(2)}s ${probe.videoStreams[0].width}x${probe.videoStreams[0].height}`);
     } catch (error) {
       this.logger.error(`Remote real media canary FAIL: ${(error as Error).message}`, (error as Error).stack);
     } finally {
