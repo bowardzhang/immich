@@ -5,8 +5,9 @@ import { promisify } from 'node:util';
 import { readFile, rm } from 'node:fs/promises';
 import sharp from 'sharp';
 import { OnEvent } from 'src/decorators';
-import { BootstrapEventPriority, StorageFolder } from 'src/enum';
+import { BootstrapEventPriority, ImmichWorker, StorageFolder } from 'src/enum';
 import { StorageCore } from 'src/cores/storage.core';
+import { ConfigRepository } from 'src/repositories/config.repository';
 import { RemoteStorageRepository } from 'src/repositories/remote-storage.repository';
 import { StorageRepository } from 'src/repositories/storage.repository';
 import { LoggingRepository } from 'src/repositories/logging.repository';
@@ -23,6 +24,7 @@ export class RemoteStorageTestService {
     private storageRepository: StorageRepository,
     private assetMediaService: AssetMediaService,
     private userRepository: UserRepository,
+    private configRepository: ConfigRepository,
     private logger: LoggingRepository,
   ) {
     this.logger.setContext(RemoteStorageTestService.name);
@@ -36,24 +38,9 @@ export class RemoteStorageTestService {
       return;
     }
 
-    await this.ensureRemoteMediaMarkers();
     await this.runRepositoryCanary();
-    await this.runRealMediaCanary();
-  }
-
-  private async ensureRemoteMediaMarkers() {
-    const folders = [StorageFolder.Upload, StorageFolder.Thumbnails, StorageFolder.EncodedVideo, StorageFolder.Profile];
-    const marker = Buffer.from('immich remote storage marker\n');
-    try {
-      for (const folder of folders) {
-        const markerPath = `${StorageCore.getBaseFolder(folder)}/.immich`;
-        if (!(await this.storageRepository.checkFileExists(markerPath))) {
-          await this.storageRepository.createFile(markerPath, marker);
-          this.logger.log(`Remote media marker initialized: ${markerPath}`);
-        }
-      }
-    } catch (error) {
-      this.logger.error(`Remote media marker initialization failed: ${(error as Error).message}`);
+    if (this.configRepository.getWorker() === ImmichWorker.Api) {
+      await this.runRealMediaCanary();
     }
   }
 
