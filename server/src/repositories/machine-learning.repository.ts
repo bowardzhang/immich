@@ -4,6 +4,7 @@ import { readFile } from 'node:fs/promises';
 import { MachineLearningConfig } from 'src/config';
 import { CLIPConfig } from 'src/dtos/model-config.dto';
 import { LoggingRepository } from 'src/repositories/logging.repository';
+import { RemoteStorageRepository } from 'src/repositories/remote-storage.repository';
 
 export interface BoundingBox {
   x1: number;
@@ -91,7 +92,10 @@ export class MachineLearningRepository {
     return this._config;
   }
 
-  constructor(private logger: LoggingRepository) {
+  constructor(
+    private logger: LoggingRepository,
+    private remoteStorageRepository: RemoteStorageRepository,
+  ) {
     this.logger.setContext(MachineLearningRepository.name);
   }
 
@@ -234,7 +238,9 @@ export class MachineLearningRepository {
     formData.append('entries', JSON.stringify(config));
 
     if ('imagePath' in payload) {
-      const fileBuffer = await readFile(payload.imagePath);
+      const fileBuffer = this.remoteStorageRepository.isRemotePath(payload.imagePath)
+        ? await this.remoteStorageRepository.readFile(payload.imagePath)
+        : await readFile(payload.imagePath);
       formData.append('image', new Blob([new Uint8Array(fileBuffer)]));
     } else if ('text' in payload) {
       formData.append('text', payload.text);
