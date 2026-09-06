@@ -8,31 +8,19 @@ const CHECK_INTERVAL_MS = Number(process.env.STORAGE_CHECK_INTERVAL_MS || 15 * 6
 const ALERT_EMAIL_TO = process.env.ALERT_EMAIL_TO || '';
 const RESEND_API_KEY = process.env.RESEND_API_KEY || '';
 const ALERT_EMAIL_FROM = process.env.ALERT_EMAIL_FROM || 'Immich Storage <onboarding@resend.dev>';
+const ALLOCATION_SAFETY_BYTES = Number(process.env.STORAGE_ALLOCATION_SAFETY_BYTES || 64 * 1024 * 1024);
 
 function parseNodes() {
-  const raw = process.env.STORAGE_NODES || '[]';
-  const parsed = JSON.parse(raw);
+  const parsed = JSON.parse(process.env.STORAGE_NODES || '[]');
   if (!Array.isArray(parsed) || parsed.length === 0) throw new Error('STORAGE_NODES must contain at least one node');
-  return parsed.map((node, index) => ({
-    name: node.name || `volume-${index + 1}`,
-    url: String(node.url).replace(/\/$/, ''),
-    token: node.token || TOKEN,
-  }));
+  return parsed.map((node, index) => ({ name: node.name || `volume-${index + 1}`, url: String(node.url).replace(/\/$/, ''), token: node.token || TOKEN }));
 }
 
-let nodes = parseNodes();
+const nodes = parseNodes();
 let lastAlertLevel = 'normal';
 
-function headers(node, extra = {}) {
-  return { ...(node.token ? { authorization: `Bearer ${node.token}` } : {}), ...extra };
-}
-
-async function request(node, pathname, init = {}) {
-  return fetch(`${node.url}${pathname}`, {
-    ...init,
-    headers: headers(node, init.headers || {}),
-  });
-}
+function headers(node, extra = {}) { return { ...(node.token ? { authorization: `Bearer ${node.token}` } : {}), ...extra }; }
+async function request(node, pathname, init = {}) { return fetch(`${node.url}${pathname}`, { ...init, headers: headers(node, init.headers || {}) }); }
 
 async function findFile(relative) {
   const pathname = `/api/file?path=${encodeURIComponent(relative)}`;
@@ -51,32 +39,25 @@ async function getStatus(node) {
   const totalBytes = Number(data.totalBytes || 0);
   const availableBytes = Number(data.availableBytes || data.freeBytes || 0);
   const usedBytes = Math.max(0, totalBytes - availableBytes);
-  const usagePercent = totalBytes > 0 ? (usedBytes / totalBytes) * 100 : 100;
-  return { name: node.name, usedBytes, availableBytes, capacityBytes: totalBytes, usagePercent };
+  return { name: node.name, usedBytes, availableBytes, capacityBytes: totalBytes, usagePercent: totalBytes > 0 ? (usedBytes / totalBytes) * 100 : 100 };
 }
 
-async function chooseNode(relative) {
+async function chooseNode(relative, requiredBytes = 0) {
   const existing = await findFile(relative);
   if (existing) return existing.node;
-
   const statuses = await Promise.all(nodes.map(async (node) => ({ node, status: await getStatus(node) })));
   statuses.sort((a, b) => b.status.availableBytes - a.status.availableBytes);
-  const selected = statuses.find(({ status }) => status.availableBytes > 0);
-  if (!selected) throw new Error('All storage volumes are full');
+  const required = Math.max(0, requiredBytes) + ALLOCATION_SAFETY_BYTES;
+  const selected = statuses.find(({ status }) => status.availableBytes >= required);
+  if (!selected) throw new Error(`No storage volume has enough free space for this file (required=${requiredBytes} bytes plus ${ALLOCATION_SAFETY_BYTES} bytes safety margin)`);
   return selected.node;
 }
 
-function json(res, status, body) {
-  res.writeHead(status, { 'content-type': 'application/json' });
-  res.end(JSON.stringify(body));
-}
+function json(res, status, body) { res.writeHead(status, { 'content-type': 'application/json' }); res.end(JSON.stringify(body)); }
 
 async function proxyResponse(res, upstream) {
   res.writeHead(upstream.status, Object.fromEntries(upstream.headers.entries()));
-  if (!upstream.body) {
-    res.end();
-    return;
-  }
+  if (!upstream.body) return res.end();
   const reader = upstream.body.getReader();
   try {
     while (true) {
@@ -85,29 +66,19 @@ async function proxyResponse(res, upstream) {
       if (!res.write(Buffer.from(value))) await new Promise((resolve) => res.once('drain', resolve));
     }
     res.end();
-  } catch (error) {
-    res.destroy(error);
-  }
+  } catch (error) { res.destroy(error); }
 }
+
+async function poolStatus() { return Promise.all(nodes.map(getStatus)); }
 
 async function sendAlert(statuses) {
   if (!RESEND_API_KEY || !ALERT_EMAIL_TO) return false;
   const level = statuses.every((item) => item.usagePercent >= CRITICAL_PERCENT) ? 'critical' : 'warning';
   if (level === lastAlertLevel) return false;
-
-  const subject = level === 'critical'
-    ? 'Immich storage is critically full — create the next Railway Volume'
-    : 'Immich storage capacity warning — prepare the next Railway Volume';
-  const lines = statuses
-    .map((item) => `${item.name}: ${item.usagePercent.toFixed(1)}% (${(item.usedBytes / 1024 ** 3).toFixed(2)} / ${(item.capacityBytes / 1024 ** 3).toFixed(2)} GiB used)`)
-    .join('\n');
+  const subject = level === 'critical' ? 'Immich storage is critically full — create the next Railway Volume' : 'Immich storage capacity warning — prepare the next Railway Volume';
+  const lines = statuses.map((item) => `${item.name}: ${item.usagePercent.toFixed(1)}% (${(item.usedBytes / 1024 ** 3).toFixed(2)} / ${(item.capacityBytes / 1024 ** 3).toFixed(2)} GiB used)`).join('\n');
   const text = `${subject}\n\n${lines}\n\nCreate the next Railway 5 GB Volume and Photo Storage service, then add it to STORAGE_NODES. No automatic provisioning is performed.`;
-
-  const response = await fetch('https://api.resend.com/emails', {
-    method: 'POST',
-    headers: { authorization: `Bearer ${RESEND_API_KEY}`, 'content-type': 'application/json' },
-    body: JSON.stringify({ from: ALERT_EMAIL_FROM, to: [ALERT_EMAIL_TO], subject, text }),
-  });
+  const response = await fetch('https://api.resend.com/emails', { method: 'POST', headers: { authorization: `Bearer ${RESEND_API_KEY}`, 'content-type': 'application/json' }, body: JSON.stringify({ from: ALERT_EMAIL_FROM, to: [ALERT_EMAIL_TO], subject, text }) });
   if (!response.ok) throw new Error(`Resend returned ${response.status}`);
   lastAlertLevel = level;
   return true;
@@ -115,126 +86,82 @@ async function sendAlert(statuses) {
 
 async function monitor() {
   try {
-    const statuses = await Promise.all(nodes.map(getStatus));
+    const statuses = await poolStatus();
     const allWarning = statuses.every((item) => item.usagePercent >= WARNING_PERCENT);
     const allCritical = statuses.every((item) => item.usagePercent >= CRITICAL_PERCENT);
     if (!allWarning) lastAlertLevel = 'normal';
     if (allWarning) await sendAlert(statuses);
     console.log(JSON.stringify({ event: 'storage-status', statuses, allWarning, allCritical }));
-  } catch (error) {
-    console.error('Storage monitor failed:', error);
-  }
+  } catch (error) { console.error('Storage monitor failed:', error); }
 }
 
 const server = http.createServer(async (req, res) => {
   try {
-    if (TOKEN && req.headers.authorization !== `Bearer ${TOKEN}`) {
-      json(res, 401, { error: 'Unauthorized' });
-      return;
-    }
+    if (TOKEN && req.headers.authorization !== `Bearer ${TOKEN}`) return json(res, 401, { error: 'Unauthorized' });
     const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
     const relative = url.searchParams.get('path') || '';
 
-    if (req.method === 'GET' && url.pathname === '/health') {
-      json(res, 200, { ok: true, nodes: nodes.length });
-      return;
+    if (req.method === 'GET' && url.pathname === '/health') return json(res, 200, { ok: true, nodes: nodes.length });
+
+    if (req.method === 'GET' && url.pathname === '/api/storage') {
+      const statuses = await poolStatus();
+      return json(res, 200, {
+        totalBytes: statuses.reduce((sum, item) => sum + item.capacityBytes, 0),
+        availableBytes: statuses.reduce((sum, item) => sum + item.availableBytes, 0),
+        freeBytes: statuses.reduce((sum, item) => sum + item.availableBytes, 0),
+        volumes: statuses,
+      });
     }
 
     if (req.method === 'GET' && url.pathname === '/api/storage/status') {
-      const statuses = await Promise.all(nodes.map(getStatus));
-      json(res, 200, {
-        volumes: statuses,
-        maxVolumes: 10,
-        warningPercent: WARNING_PERCENT,
-        criticalPercent: CRITICAL_PERCENT,
-        nextVolumeRecommended: statuses.every((item) => item.usagePercent >= WARNING_PERCENT),
-      });
-      return;
+      const statuses = await poolStatus();
+      return json(res, 200, { volumes: statuses, maxVolumes: 10, warningPercent: WARNING_PERCENT, criticalPercent: CRITICAL_PERCENT, nextVolumeRecommended: statuses.every((item) => item.usagePercent >= WARNING_PERCENT) });
     }
 
     if ((req.method === 'GET' || req.method === 'HEAD') && url.pathname === '/api/file') {
       const found = await findFile(relative);
-      if (!found) {
-        json(res, 404, { error: 'File not found' });
-        return;
-      }
-      const upstream = await request(found.node, `/api/file?path=${encodeURIComponent(relative)}`, {
-        method: req.method,
-        headers: req.headers.range ? { range: req.headers.range } : {},
-      });
-      await proxyResponse(res, upstream);
-      return;
+      if (!found) return json(res, 404, { error: 'File not found' });
+      const upstream = await request(found.node, `/api/file?path=${encodeURIComponent(relative)}`, { method: req.method, headers: req.headers.range ? { range: req.headers.range } : {} });
+      return proxyResponse(res, upstream);
     }
 
     if (req.method === 'PUT' && url.pathname === '/api/file') {
-      const node = await chooseNode(relative);
+      const requiredBytes = Number(req.headers['content-length'] || 0);
+      const node = await chooseNode(relative, Number.isFinite(requiredBytes) ? requiredBytes : 0);
       const upstream = await request(node, `/api/file?path=${encodeURIComponent(relative)}`, {
-        method: 'PUT',
-        body: req,
-        duplex: 'half',
-        headers: {
-          'content-type': req.headers['content-type'] || 'application/octet-stream',
-          ...(req.headers['content-length'] ? { 'content-length': req.headers['content-length'] } : {}),
-        },
+        method: 'PUT', body: req, duplex: 'half',
+        headers: { 'content-type': req.headers['content-type'] || 'application/octet-stream', ...(req.headers['content-length'] ? { 'content-length': req.headers['content-length'] } : {}) },
       });
-      await proxyResponse(res, upstream);
-      return;
+      return proxyResponse(res, upstream);
     }
 
     if (req.method === 'DELETE' && url.pathname === '/api/file') {
       const found = await findFile(relative);
-      if (!found) {
-        json(res, 404, { error: 'File not found' });
-        return;
-      }
+      if (!found) return json(res, 404, { error: 'File not found' });
       const upstream = await request(found.node, `/api/file?path=${encodeURIComponent(relative)}`, { method: 'DELETE' });
-      await proxyResponse(res, upstream);
-      return;
+      return proxyResponse(res, upstream);
     }
 
     if (req.method === 'MOVE' && url.pathname === '/api/file') {
       const source = url.searchParams.get('source') || '';
-      const target = relative;
       const found = await findFile(source);
-      if (!found) {
-        json(res, 404, { error: 'Source file not found' });
-        return;
-      }
-
-      const targetNode = await chooseNode(target);
+      if (!found) return json(res, 404, { error: 'Source file not found' });
+      const sourceSize = Number(found.response.headers.get('content-length') || 0);
+      const targetNode = await chooseNode(relative, Number.isFinite(sourceSize) ? sourceSize : 0);
       if (targetNode === found.node) {
-        const upstream = await request(
-          targetNode,
-          `/api/file?path=${encodeURIComponent(target)}&source=${encodeURIComponent(source)}`,
-          { method: 'MOVE' },
-        );
-        await proxyResponse(res, upstream);
-        return;
+        const upstream = await request(targetNode, `/api/file?path=${encodeURIComponent(relative)}&source=${encodeURIComponent(source)}`, { method: 'MOVE' });
+        return proxyResponse(res, upstream);
       }
-
       const sourceResponse = await request(found.node, `/api/file?path=${encodeURIComponent(source)}`);
-      if (!sourceResponse.ok || !sourceResponse.body) {
-        throw new Error(`Unable to read source file: ${sourceResponse.status} ${sourceResponse.statusText}`);
-      }
-      const uploadResponse = await request(targetNode, `/api/file?path=${encodeURIComponent(target)}`, {
-        method: 'PUT',
-        body: sourceResponse.body,
-        duplex: 'half',
-        headers: {
-          'content-type': sourceResponse.headers.get('content-type') || 'application/octet-stream',
-          ...(sourceResponse.headers.get('content-length') ? { 'content-length': sourceResponse.headers.get('content-length') } : {}),
-        },
+      if (!sourceResponse.ok || !sourceResponse.body) throw new Error(`Unable to read source file: ${sourceResponse.status} ${sourceResponse.statusText}`);
+      const uploadResponse = await request(targetNode, `/api/file?path=${encodeURIComponent(relative)}`, {
+        method: 'PUT', body: sourceResponse.body, duplex: 'half',
+        headers: { 'content-type': sourceResponse.headers.get('content-type') || 'application/octet-stream', ...(sourceResponse.headers.get('content-length') ? { 'content-length': sourceResponse.headers.get('content-length') } : {}) },
       });
-      if (!uploadResponse.ok) {
-        throw new Error(`Unable to write target file: ${uploadResponse.status} ${uploadResponse.statusText}`);
-      }
-
+      if (!uploadResponse.ok) throw new Error(`Unable to write target file: ${uploadResponse.status} ${uploadResponse.statusText}`);
       const deleteResponse = await request(found.node, `/api/file?path=${encodeURIComponent(source)}`, { method: 'DELETE' });
-      if (!deleteResponse.ok) {
-        throw new Error(`Target written but source deletion failed: ${deleteResponse.status} ${deleteResponse.statusText}`);
-      }
-      json(res, 200, { source, path: target });
-      return;
+      if (!deleteResponse.ok) throw new Error(`Target written but source deletion failed: ${deleteResponse.status} ${deleteResponse.statusText}`);
+      return json(res, 200, { source, path: relative });
     }
 
     if (req.method === 'GET' && url.pathname === '/api/list') {
@@ -246,13 +173,14 @@ const server = http.createServer(async (req, res) => {
         const data = await upstream.json();
         for (const entry of data.entries || []) merged.set(entry.path, entry);
       }
-      json(res, 200, { entries: [...merged.values()] });
-      return;
+      return json(res, 200, { entries: [...merged.values()] });
     }
 
-    json(res, 404, { error: 'Not found' });
+    return json(res, 404, { error: 'Not found' });
   } catch (error) {
-    json(res, 500, { error: error instanceof Error ? error.message : String(error) });
+    const message = error instanceof Error ? error.message : String(error);
+    const status = message.includes('No storage volume has enough free space') ? 507 : 500;
+    return json(res, status, { error: message });
   }
 });
 
