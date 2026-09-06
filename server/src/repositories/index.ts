@@ -32,6 +32,7 @@ import { PartnerRepository } from 'src/repositories/partner.repository';
 import { PersonRepository } from 'src/repositories/person.repository';
 import { PluginRepository } from 'src/repositories/plugin.repository';
 import { ProcessRepository } from 'src/repositories/process.repository';
+import { RemoteMediaAdapterRepository } from 'src/repositories/remote-media-adapter.repository';
 import { RemoteStorageRepository } from 'src/repositories/remote-storage.repository';
 import { SearchRepository } from 'src/repositories/search.repository';
 import { ServerInfoRepository } from 'src/repositories/server-info.repository';
@@ -89,6 +90,7 @@ export const repositories = [
   PluginRepository,
   ProcessRepository,
   RemoteStorageRepository,
+  RemoteMediaAdapterRepository,
   SearchRepository,
   SessionRepository,
   ServerInfoRepository,
