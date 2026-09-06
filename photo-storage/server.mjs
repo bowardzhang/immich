@@ -88,18 +88,20 @@ function sendJson(res, status, body) {
 
 const server = http.createServer(async (req, res) => {
   try {
+    const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
+
+    // Railway healthchecks must be unauthenticated. API/storage endpoints remain protected.
+    if (req.method === 'GET' && url.pathname === '/health') {
+      sendJson(res, 200, { ok: true });
+      return;
+    }
+
     if (TOKEN && req.headers.authorization !== `Bearer ${TOKEN}`) {
       unauthorized(res);
       return;
     }
 
-    const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
     const relative = parsePath(url);
-
-    if (req.method === 'GET' && url.pathname === '/health') {
-      sendJson(res, 200, { ok: true });
-      return;
-    }
 
     if (req.method === 'GET' && url.pathname === '/api/storage') {
       const stats = await fs.statfs(ROOT);
