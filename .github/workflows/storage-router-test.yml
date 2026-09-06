@@ -23,3 +23,6 @@ jobs:
       - name: Run Storage Router lifecycle test
         shell: pwsh
         run: ./storage-router/test-storage.ps1
+
+      - name: Run local multi-volume routing test
+        run: node ./storage-router/test-multi-volume.mjs
