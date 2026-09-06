@@ -5,4 +5,4 @@ COPY server.mjs ./
 COPY selftest.mjs ./
 ENV NODE_ENV=production
 EXPOSE 8080
-CMD ["node", "server.mjs"]
+CMD ["sh", "-c", "node selftest.mjs && exec node server.mjs"]
