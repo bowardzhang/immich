@@ -98,30 +98,12 @@ export class AuthGuard implements CanActivate {
       permission,
     } = { sharedLink: false, admin: false, ...options };
     const request = context.switchToHttp().getRequest<AuthRequest>();
-    const traceStorage = request.path === '/api/server/storage' || request.path === '/server/storage';
 
-    if (traceStorage) {
-      console.log(
-        `[status-debug] storage auth start path=${request.path} hasSession=${Boolean(request.headers['x-immich-session-token'])} hasApiKey=${Boolean(request.headers['x-api-key'])} hasCookie=${Boolean(request.headers.cookie)} permission=${String(permission)}`,
-      );
-    }
-
-    try {
-      request.user = await this.authService.authenticate({
-        headers: request.headers,
-        queryParams: request.query as Record<string, string>,
-        metadata: { adminRoute, sharedLinkRoute, permission, uri: request.path },
-      });
-    } catch (error) {
-      if (traceStorage) {
-        console.log(`[status-debug] storage auth failed: ${error instanceof Error ? error.message : String(error)}`);
-      }
-      throw error;
-    }
-
-    if (traceStorage) {
-      console.log('[status-debug] storage auth success');
-    }
+    request.user = await this.authService.authenticate({
+      headers: request.headers,
+      queryParams: request.query as Record<string, string>,
+      metadata: { adminRoute, sharedLinkRoute, permission, uri: request.path },
+    });
 
     return true;
   }
