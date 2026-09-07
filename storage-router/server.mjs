@@ -1,7 +1,7 @@
 import http from 'node:http';
 import crypto from 'node:crypto';
 import { createReadStream, createWriteStream } from 'node:fs';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, rm, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { pipeline } from 'node:stream/promises';
 
@@ -129,7 +129,15 @@ async function spoolRequestBody(req, contentLength) {
   const file = `${dir}/payload.bin`;
   try {
     await pipeline(req, createWriteStream(file));
-    return { dir, file };
+    const fileStat = await stat(file);
+    const actualBytes = fileStat.size;
+    if (actualBytes > MAX_UPLOAD_SPOOL_BYTES) {
+      throw new Error(`Upload exceeds STORAGE_MAX_UPLOAD_SPOOL_BYTES (${MAX_UPLOAD_SPOOL_BYTES} bytes)`);
+    }
+    if (contentLength > 0 && actualBytes !== contentLength) {
+      throw new Error(`Upload size mismatch: declared=${contentLength} bytes actual=${actualBytes} bytes`);
+    }
+    return { dir, file, actualBytes };
   } catch (error) {
     await rm(dir, { recursive: true, force: true }).catch(() => {});
     throw error;
@@ -301,15 +309,15 @@ const server = http.createServer(async (req, res) => {
       return proxyResponse(res, upstream);
     }
     if (req.method === 'PUT' && url.pathname === '/api/file') {
-      const requiredBytes = Number(req.headers['content-length'] || 0);
-      const contentLength = Number.isFinite(requiredBytes) ? requiredBytes : 0;
-      const headersIn = {
-        'content-type': req.headers['content-type'] || 'application/octet-stream',
-        ...(req.headers['content-length'] ? { 'content-length': req.headers['content-length'] } : {}),
-      };
-      const { dir, file } = await spoolRequestBody(req, contentLength);
+      const declaredBytes = Number(req.headers['content-length'] || 0);
+      const contentLength = Number.isFinite(declaredBytes) && declaredBytes > 0 ? declaredBytes : 0;
+      const { dir, file, actualBytes } = await spoolRequestBody(req, contentLength);
       try {
-        const { upstream } = await putWithFailover(relative, file, headersIn, contentLength);
+        const headersIn = {
+          'content-type': req.headers['content-type'] || 'application/octet-stream',
+          'content-length': String(actualBytes),
+        };
+        const { upstream } = await putWithFailover(relative, file, headersIn, actualBytes);
         return proxyResponse(res, upstream);
       } finally {
         await rm(dir, { recursive: true, force: true }).catch(() => {});
@@ -375,7 +383,12 @@ const server = http.createServer(async (req, res) => {
     return json(res, 404, { error: 'Not found' });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    return json(res, message.includes('No healthy storage volume') ? 507 : 500, { error: message });
+    const status = message.includes('No healthy storage volume')
+      ? 507
+      : message.includes('STORAGE_MAX_UPLOAD_SPOOL_BYTES')
+        ? 413
+        : 500;
+    return json(res, status, { error: message });
   }
 });
 
