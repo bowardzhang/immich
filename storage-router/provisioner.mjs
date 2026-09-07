@@ -17,10 +17,18 @@ const HEALTH_TIMEOUT_MS = Number(process.env.STORAGE_PROVISION_HEALTH_TIMEOUT_MS
 const RETRY_COUNT = Number(process.env.RAILWAY_API_RETRY_COUNT || 4);
 let lastProvisionAt = 0;
 let running = false;
+let successfulAuthMode = null;
 
-function authHeaders() {
-  if (PROJECT_TOKEN) return { 'Project-Access-Token': PROJECT_TOKEN };
-  if (API_TOKEN) return { authorization: `Bearer ${API_TOKEN}` };
+function authHeaderCandidates() {
+  if (PROJECT_TOKEN) {
+    return [{ mode: 'project-token', headers: { 'Project-Access-Token': PROJECT_TOKEN } }];
+  }
+  if (API_TOKEN) {
+    return [
+      { mode: 'api-token', headers: { authorization: `Bearer ${API_TOKEN}` } },
+      { mode: 'project-token-fallback', headers: { 'Project-Access-Token': API_TOKEN } },
+    ];
+  }
   throw new Error('RAILWAY_PROJECT_TOKEN or RAILWAY_API_TOKEN is not configured');
 }
 
@@ -32,28 +40,50 @@ function retryableStatus(status) {
   return status === 429 || status >= 500;
 }
 
+function isUnauthorized(status, message) {
+  return status === 401 || status === 403 || /not authorized|unauthorized/i.test(message);
+}
+
 async function gql(query, variables = {}) {
   let lastError;
-  for (let attempt = 0; attempt <= RETRY_COUNT; attempt += 1) {
-    try {
-      const response = await fetch(API_URL, {
-        method: 'POST',
-        headers: { ...authHeaders(), 'content-type': 'application/json' },
-        body: JSON.stringify({ query, variables }),
-      });
-      const body = await response.json().catch(() => ({}));
-      if (response.ok && !body.errors?.length) return body.data;
-      const message = body.errors?.map((error) => error.message).join('; ') || `Railway API ${response.status}`;
-      lastError = new Error(message);
-      if (!retryableStatus(response.status) || attempt === RETRY_COUNT) throw lastError;
-      const retryAfter = Number(response.headers.get('retry-after') || 0);
-      await sleep(retryAfter > 0 ? retryAfter * 1000 : 500 * 2 ** attempt);
-    } catch (error) {
-      lastError = error;
-      if (attempt === RETRY_COUNT) throw error;
-      await sleep(500 * 2 ** attempt);
+  const candidates = authHeaderCandidates();
+
+  for (let candidateIndex = 0; candidateIndex < candidates.length; candidateIndex += 1) {
+    const candidate = candidates[candidateIndex];
+    for (let attempt = 0; attempt <= RETRY_COUNT; attempt += 1) {
+      try {
+        const response = await fetch(API_URL, {
+          method: 'POST',
+          headers: { ...candidate.headers, 'content-type': 'application/json' },
+          body: JSON.stringify({ query, variables }),
+        });
+        const body = await response.json().catch(() => ({}));
+        if (response.ok && !body.errors?.length) {
+          successfulAuthMode = candidate.mode;
+          return body.data;
+        }
+
+        const message = body.errors?.map((error) => error.message).join('; ') || `Railway API ${response.status}`;
+        lastError = new Error(message);
+
+        if (isUnauthorized(response.status, message) && candidateIndex < candidates.length - 1) {
+          break;
+        }
+        if (!retryableStatus(response.status) || attempt === RETRY_COUNT) throw lastError;
+
+        const retryAfter = Number(response.headers.get('retry-after') || 0);
+        await sleep(retryAfter > 0 ? retryAfter * 1000 : 500 * 2 ** attempt);
+      } catch (error) {
+        lastError = error;
+        if (attempt === RETRY_COUNT) {
+          if (candidateIndex < candidates.length - 1 && /not authorized|unauthorized/i.test(String(error?.message || error))) break;
+          throw error;
+        }
+        await sleep(500 * 2 ** attempt);
+      }
     }
   }
+
   throw lastError || new Error('Railway API request failed');
 }
 
@@ -222,6 +252,7 @@ export async function verifyProvisioningAccess() {
   const services = await listServices();
   return {
     enabled: true,
+    authMode: successfulAuthMode,
     projectId: PROJECT_ID,
     environmentId: ENVIRONMENT_ID,
     routerServiceId: ROUTER_SERVICE_ID,
