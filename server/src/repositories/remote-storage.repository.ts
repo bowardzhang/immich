@@ -10,7 +10,7 @@ import { mimeTypes } from 'src/utils/mime-types';
 interface RemoteEntry { path: string; type: 'file' | 'directory'; size?: number; mtime?: string; }
 interface RemoteListResponse { entries: RemoteEntry[]; }
 export interface RemoteReadStream { stream: Readable; type?: string; length?: number; }
-type RequestInitWithDuplex = RequestInit & { duplex?: 'half'; timeoutMs?: number | null };
+type RequestInitWithDuplex = RequestInit & { duplex?: 'half'; timeoutMs?: number | null; retry?: boolean };
 @Injectable()
 export class RemoteStorageRepository {
   private readonly prefix = '/remote/photo-extern'; private readonly baseUrl: string; private readonly token?: string;
@@ -20,12 +20,12 @@ export class RemoteStorageRepository {
   private buildUrl(endpoint: 'list' | 'file' | 'storage', relativePath: string, recursive = false, source?: string): URL { if (!this.baseUrl) throw new Error('REMOTE_STORAGE_URL is not configured'); const url = new URL(`/api/${endpoint}`, this.baseUrl); if (endpoint !== 'storage') { url.searchParams.set('path', relativePath); if (endpoint === 'list') url.searchParams.set('recursive', String(recursive)); if (source !== undefined) url.searchParams.set('source', source); } return url; }
   private headers(): HeadersInit { return this.token ? { Authorization: `Bearer ${this.token}` } : {}; }
   private async request(url: URL, init?: RequestInitWithDuplex): Promise<Response> {
-    const maxAttempts = 3;
+    const maxAttempts = init?.retry === false ? 1 : 3;
     let lastError: unknown;
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       try {
         const timeoutMs = init?.timeoutMs === undefined ? 20_000 : init.timeoutMs;
-        const { timeoutMs: _timeoutMs, ...fetchInit } = init || {};
+        const { timeoutMs: _timeoutMs, retry: _retry, ...fetchInit } = init || {};
         const response = await fetch(url, {
           ...fetchInit,
           headers: { ...this.headers(), ...(init?.headers || {}) },
@@ -46,7 +46,7 @@ export class RemoteStorageRepository {
     }
     throw lastError instanceof Error ? lastError : new Error(String(lastError));
   }
-  private async uploadFile(localPath: string, remotePath: string) { const stat = await fs.stat(localPath); const body = Readable.toWeb(createReadStream(localPath)) as unknown as BodyInit; const response = await this.request(this.buildUrl('file', this.relativePath(remotePath)), { method: 'PUT', body, duplex: 'half', timeoutMs: null, headers: { 'content-length': String(stat.size), 'content-type': mimeTypes.lookup(localPath) } }); await response.arrayBuffer(); }
+  private async uploadFile(localPath: string, remotePath: string) { const stat = await fs.stat(localPath); const body = Readable.toWeb(createReadStream(localPath)) as unknown as BodyInit; const response = await this.request(this.buildUrl('file', this.relativePath(remotePath)), { method: 'PUT', body, duplex: 'half', timeoutMs: null, retry: false, headers: { 'content-length': String(stat.size), 'content-type': mimeTypes.lookup(localPath) } }); await response.arrayBuffer(); }
   async stat(filepath: string): Promise<Stats> { const response = await this.request(this.buildUrl('file', this.relativePath(filepath)), { method: 'HEAD' }); const size = Number(response.headers.get('content-length') || 0); const modified = response.headers.get('last-modified'); const mtime = modified ? new Date(modified) : new Date(0); const isDirectory = response.headers.get('x-remote-type') === 'directory'; return { size, mtime, mtimeMs: mtime.getTime(), ctime: mtime, ctimeMs: mtime.getTime(), birthtime: mtime, birthtimeMs: mtime.getTime(), atime: mtime, atimeMs: mtime.getTime(), dev: 0, ino: 0, mode: isDirectory ? 0o755 : 0o644, nlink: 1, uid: 0, gid: 0, rdev: 0, blksize: 4096, blocks: Math.ceil(size / 512), isDirectory: () => isDirectory, isFile: () => !isDirectory, isBlockDevice: () => false, isCharacterDevice: () => false, isSymbolicLink: () => false, isFIFO: () => false, isSocket: () => false } as Stats; }
   async checkFileExists(filepath: string, mode = constants.F_OK): Promise<boolean> { if (mode !== constants.F_OK && mode !== constants.R_OK && mode !== constants.W_OK) return false; try { await this.stat(filepath); return true; } catch { return false; } }
   async readdir(filepath: string): Promise<string[]> { const response = await this.request(this.buildUrl('list', this.relativePath(filepath), false)); const result = (await response.json()) as RemoteListResponse; return result.entries.map((entry) => path.posix.basename(entry.path)); }
@@ -64,6 +64,7 @@ export class RemoteStorageRepository {
       body,
       duplex: 'half',
       timeoutMs: null,
+      retry: false,
       headers: { 'content-type': mimeTypes.lookup(filepath) },
     }).then(async (response) => { await response.arrayBuffer(); });
     upload.catch((error) => input.destroy(error as Error));
@@ -87,7 +88,7 @@ export class RemoteStorageRepository {
   async rename(source: string, target: string) { await this.request(this.buildUrl('file', this.relativePath(target), false, this.relativePath(source)), { method: 'MOVE' }); }
   async unlink(filepath: string) { await this.request(this.buildUrl('file', this.relativePath(filepath)), { method: 'DELETE' }); }
   async utimes(_filepath: string, _atime: Date, _mtime: Date) { /* remote filesystem mtime is retained */ }
-  async copyFile(source: string, target: string) { const response = await this.request(this.buildUrl('file', this.relativePath(source)), { method: 'GET', timeoutMs: null }); if (!response.body) throw new Error(`Remote storage returned an empty response for ${source}`); await this.request(this.buildUrl('file', this.relativePath(target)), { method: 'PUT', body: response.body as unknown as BodyInit, duplex: 'half', timeoutMs: null, headers: { 'content-type': response.headers.get('content-type') || mimeTypes.lookup(target) } }); }
+  async copyFile(source: string, target: string) { const response = await this.request(this.buildUrl('file', this.relativePath(source)), { method: 'GET', timeoutMs: null }); if (!response.body) throw new Error(`Remote storage returned an empty response for ${source}`); await this.request(this.buildUrl('file', this.relativePath(target)), { method: 'PUT', body: response.body as unknown as BodyInit, duplex: 'half', timeoutMs: null, retry: false, headers: { 'content-type': response.headers.get('content-type') || mimeTypes.lookup(target) } }); }
   async *walk(walkOptions: WalkOptionsDto): AsyncGenerator<string[]> { const { pathsToCrawl, exclusionPatterns, includeHidden, take } = walkOptions; if (pathsToCrawl.length === 0) return; const matcher = picomatch(exclusionPatterns || []); const extensions = mimeTypes.getSupportedFileExtensions().map((extension) => extension.toLowerCase()); let batch: string[] = []; for (const root of pathsToCrawl) { const response = await this.request(this.buildUrl('list', this.relativePath(root), true)); const result = (await response.json()) as RemoteListResponse; for (const entry of result.entries) { if (entry.type !== 'file') continue; const remotePath = `${this.prefix}/${entry.path}`; const filename = path.posix.basename(entry.path); if (!extensions.includes(path.posix.extname(filename).toLowerCase())) continue; if (!includeHidden && filename.startsWith('.')) continue; if (matcher(remotePath) || matcher(entry.path)) continue; batch.push(remotePath); if (batch.length >= take) { yield batch; batch = []; } } } if (batch.length > 0) yield batch; }
   async crawl(crawlOptions: CrawlOptionsDto): Promise<string[]> { const paths: string[] = []; for await (const batch of this.walk({ ...crawlOptions, take: Number.MAX_SAFE_INTEGER })) paths.push(...batch); return paths; }
   realpath(filepath: string): string { this.relativePath(filepath); return path.posix.normalize(filepath); }
