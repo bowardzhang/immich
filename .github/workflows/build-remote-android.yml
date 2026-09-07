@@ -1,0 +1,62 @@
+name: Build Railway-tuned Android APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [3.1.0-remote]
+    paths:
+      - 'mobile/**'
+      - '.github/workflows/build-remote-android.yml'
+
+concurrency:
+  group: build-remote-android-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.44.8'
+          channel: stable
+          cache: true
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Flutter dependencies
+        working-directory: mobile
+        run: flutter pub get --enforce-lockfile
+
+      - name: Generate Pigeon platform APIs
+        working-directory: mobile
+        run: |
+          ls pigeon/*.dart | xargs -n1 -P4 -I{} dart run pigeon --input {}
+          dart format lib/platform/
+
+      - name: Build debug APK
+        working-directory: mobile
+        run: flutter build apk --debug
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: immich-railway-android-debug
+          path: mobile/build/app/outputs/flutter-apk/app-debug.apk
+          if-no-files-found: error
+          retention-days: 14
