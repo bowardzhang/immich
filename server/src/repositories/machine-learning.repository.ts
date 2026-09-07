@@ -121,6 +121,10 @@ export class MachineLearningRepository {
     );
   }
 
+  getConfig() {
+    return this.config;
+  }
+
   teardown() {
     if (this.interval) {
       clearInterval(this.interval);
@@ -181,11 +185,11 @@ export class MachineLearningRepository {
         }
 
         this.logger.warn(
-          `Machine learning request to "${url}" failed with status ${response.status}: ${response.statusText}`,
+          `Machine learning request to \"${url}\" failed with status ${response.status}: ${response.statusText}`,
         );
       } catch (error: Error | unknown) {
         this.logger.warn(
-          `Machine learning request to "${url}" failed: ${error instanceof Error ? error.message : error}`,
+          `Machine learning request to \"${url}\" failed: ${error instanceof Error ? error.message : error}`,
         );
       }
 
