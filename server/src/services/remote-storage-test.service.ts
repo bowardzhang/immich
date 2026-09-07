@@ -88,6 +88,7 @@ export class RemoteStorageTestService {
     const videoId = randomUUID();
     const tmpVideo = `/tmp/immich-remote-canary-${videoId}.mp4`;
     const remoteVideoPath = `/remote/photo-extern/.immich-router-canary/${videoId}.mp4`;
+    const remoteMlImagePath = `/remote/photo-extern/.immich-router-canary/${imageId}-ml.jpg`;
 
     try {
       const imageBuffer = await sharp({
@@ -107,7 +108,9 @@ export class RemoteStorageTestService {
       if (previewStat.size <= 0) throw new Error('remote thumbnail was empty');
       this.logger.log(`Remote staged thumbnail PASS: ${directPreview} (${previewStat.size} bytes)`);
 
-      await this.runMachineLearningCanary(imagePath);
+      await this.storageRepository.createFile(remoteMlImagePath, imageBuffer);
+      await this.runMachineLearningCanary(remoteMlImagePath);
+      await this.storageRepository.unlink(remoteMlImagePath).catch(() => undefined);
 
       const r = Math.floor(Math.random() * 255);
       const g = Math.floor(Math.random() * 255);
@@ -133,6 +136,7 @@ export class RemoteStorageTestService {
       await this.storageRepository.unlink(remoteVideoPath);
     } catch (error) {
       this.logger.error(`Remote real media canary FAIL: ${(error as Error).message}`, (error as Error).stack);
+      await this.storageRepository.unlink(remoteMlImagePath).catch(() => undefined);
       await this.storageRepository.unlink(remoteVideoPath).catch(() => undefined);
     } finally {
       await rm(tmpVideo, { force: true }).catch(() => undefined);
