@@ -30,7 +30,11 @@ function startMock(index) {
         return;
       }
       const chunks = [];
-      for await (const chunk of req) chunks.push(chunk);
+      try {
+        for await (const chunk of req) chunks.push(chunk);
+      } catch {
+        return;
+      }
       store.set(path, Buffer.concat(chunks));
       return res.writeHead(201).end();
     }
@@ -126,6 +130,27 @@ try {
   assert(r.status === 201, `stream failover PUT returned ${r.status}`);
   assert(!volumes[1].has(failoverPath), 'failed primary unexpectedly retained the failover file');
   assert(volumes[0].get(failoverPath)?.toString() === 'stream-failover', 'spool failover did not preserve upload content');
+
+  // A client abort must not kill or wedge the router, and must not commit a partial object.
+  const abortedPath = 'new/client-aborted.txt';
+  await new Promise((resolve) => {
+    const req = http.request({
+      hostname: '127.0.0.1',
+      port: routerPort,
+      path: `/api/file?path=${encodeURIComponent(abortedPath)}`,
+      method: 'PUT',
+      headers: { authorization: `Bearer ${TOKEN}`, 'content-type': 'application/octet-stream', 'content-length': '100000' },
+    });
+    let settled = false;
+    const done = () => { if (!settled) { settled = true; resolve(); } };
+    req.on('error', done);
+    req.write(Buffer.alloc(128, 1));
+    setTimeout(() => { req.destroy(); done(); }, 20);
+  });
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  r = await fetch(`${base}/health`);
+  assert(r.status === 200, 'router did not recover after client-aborted upload');
+  assert(!volumes[0].has(abortedPath) && !volumes[1].has(abortedPath), 'client-aborted upload committed a partial file');
 
   // LIST must merge both volumes.
   r = await fetch(`${base}/api/list?path=&recursive=true`, { headers: { authorization: `Bearer ${TOKEN}` } });
