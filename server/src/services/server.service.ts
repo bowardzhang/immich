@@ -26,6 +26,11 @@ import {
   isSmartSearchEnabled,
 } from 'src/utils/misc';
 
+interface RemoteStorageInfo {
+  totalBytes: number;
+  availableBytes: number;
+}
+
 @Injectable()
 export class ServerService extends BaseService {
   @OnEvent({ name: 'AppBootstrap' })
@@ -64,19 +69,64 @@ export class ServerService extends BaseService {
     };
   }
 
-  async getStorage(): Promise<ServerStorageResponseDto> {
-    const libraryBase = StorageCore.getBaseFolder(StorageFolder.Library);
-    const diskInfo = await this.storageRepository.checkDiskUsage(libraryBase);
+  private async getRemoteStorageInfo(): Promise<RemoteStorageInfo | null> {
+    const remoteStorageUrl = process.env.REMOTE_STORAGE_URL?.replace(/\/$/, '');
+    if (!remoteStorageUrl) {
+      return null;
+    }
 
-    const usagePercentage = (((diskInfo.total - diskInfo.free) / diskInfo.total) * 100).toFixed(2);
+    try {
+      const token = process.env.REMOTE_STORAGE_TOKEN;
+      const response = await fetch(`${remoteStorageUrl}/api/storage`, {
+        headers: token ? { authorization: `Bearer ${token}` } : undefined,
+        signal: AbortSignal.timeout(5000),
+      });
+      if (!response.ok) {
+        throw new Error(`${response.status} ${response.statusText}`);
+      }
+
+      const data = (await response.json()) as Partial<RemoteStorageInfo>;
+      const totalBytes = Number(data.totalBytes ?? 0);
+      const availableBytes = Number(data.availableBytes ?? 0);
+      if (!Number.isFinite(totalBytes) || !Number.isFinite(availableBytes) || totalBytes <= 0 || availableBytes < 0) {
+        throw new Error('Storage Router returned invalid capacity data');
+      }
+
+      return { totalBytes, availableBytes: Math.min(availableBytes, totalBytes) };
+    } catch (error) {
+      this.logger.warn(`Unable to read aggregate remote storage capacity; falling back to local storage: ${error}`);
+      return null;
+    }
+  }
+
+  async getStorage(): Promise<ServerStorageResponseDto> {
+    const remoteDiskInfo = await this.getRemoteStorageInfo();
+    let total: number;
+    let available: number;
+    let free: number;
+
+    if (remoteDiskInfo) {
+      total = remoteDiskInfo.totalBytes;
+      available = remoteDiskInfo.availableBytes;
+      free = remoteDiskInfo.availableBytes;
+    } else {
+      const libraryBase = StorageCore.getBaseFolder(StorageFolder.Library);
+      const diskInfo = await this.storageRepository.checkDiskUsage(libraryBase);
+      total = diskInfo.total;
+      available = diskInfo.available;
+      free = diskInfo.free;
+    }
+
+    const used = Math.max(0, total - free);
+    const usagePercentage = total > 0 ? ((used / total) * 100).toFixed(2) : '0.00';
 
     const serverInfo = new ServerStorageResponseDto();
-    serverInfo.diskAvailable = asHumanReadable(diskInfo.available);
-    serverInfo.diskSize = asHumanReadable(diskInfo.total);
-    serverInfo.diskUse = asHumanReadable(diskInfo.total - diskInfo.free);
-    serverInfo.diskAvailableRaw = diskInfo.available;
-    serverInfo.diskSizeRaw = diskInfo.total;
-    serverInfo.diskUseRaw = diskInfo.total - diskInfo.free;
+    serverInfo.diskAvailable = asHumanReadable(available);
+    serverInfo.diskSize = asHumanReadable(total);
+    serverInfo.diskUse = asHumanReadable(used);
+    serverInfo.diskAvailableRaw = available;
+    serverInfo.diskSizeRaw = total;
+    serverInfo.diskUseRaw = used;
     serverInfo.diskUsagePercentage = Number(usagePercentage);
     return serverInfo;
   }
@@ -120,7 +170,7 @@ export class ServerService extends BaseService {
       loginPageMessage: config.server.loginPageMessage,
       trashDays: config.trash.days,
       userDeleteDelay: config.user.deleteDelay,
-      oauthButtonText: config.oauth.buttonText,
+      oauthButtonText: config.oauthButtonText,
       isInitialized,
       isOnboarded: onboarding?.isOnboarded || false,
       externalDomain: config.server.externalDomain,
