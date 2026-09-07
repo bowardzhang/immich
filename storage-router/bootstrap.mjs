@@ -1,5 +1,19 @@
-import './server.mjs';
 import { ensureNextVolume, provisioningEnabled, verifyProvisioningAccess } from './provisioner.mjs';
+
+const nativeFetch = globalThis.fetch;
+globalThis.fetch = async (...args) => {
+  const response = await nativeFetch(...args);
+  try {
+    const target = typeof args[0] === 'string' ? args[0] : args[0]?.url;
+    if (target === 'https://api.resend.com/emails' && !response.ok) {
+      const body = await response.clone().text().catch(() => '');
+      console.error(JSON.stringify({ event: 'resend-error', status: response.status, body }));
+    }
+  } catch {}
+  return response;
+};
+
+await import('./server.mjs');
 
 const PORT = Number(process.env.PORT || 8080);
 const TOKEN = process.env.REMOTE_STORAGE_TOKEN || '';
