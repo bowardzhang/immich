@@ -5,8 +5,7 @@ import { promisify } from 'node:util';
 import { readFile, rm } from 'node:fs/promises';
 import sharp from 'sharp';
 import { OnEvent } from 'src/decorators';
-import { BootstrapEventPriority, ImmichWorker, StorageFolder } from 'src/enum';
-import { StorageCore } from 'src/cores/storage.core';
+import { BootstrapEventPriority, ImmichWorker } from 'src/enum';
 import { ConfigRepository } from 'src/repositories/config.repository';
 import { StorageRepository } from 'src/repositories/storage.repository';
 import { LoggingRepository } from 'src/repositories/logging.repository';
@@ -87,23 +86,26 @@ export class RemoteStorageTestService {
     const imageId = randomUUID();
     const videoId = randomUUID();
     const tmpVideo = `/tmp/immich-remote-canary-${videoId}.mp4`;
-    const remoteVideoPath = `/remote/photo-extern/.immich-router-canary/${videoId}.mp4`;
-    const remoteMlImagePath = `/remote/photo-extern/.immich-router-canary/${imageId}-ml.jpg`;
+    const root = '/remote/photo-extern/.immich-router-canary';
+    const remoteImagePath = `${root}/${imageId}.jpg`;
+    const remoteVideoPath = `${root}/${videoId}.mp4`;
+    const remoteMlImagePath = `${root}/${imageId}-ml.jpg`;
 
     try {
       const imageBuffer = await sharp({
         create: { width: 64, height: 48, channels: 3, background: { r: Math.floor(Math.random() * 255), g: 120, b: 160 } },
       }).jpeg({ quality: 85 }).toBuffer();
-      const imagePath = await this.writeSyntheticAsset(auth.user.id, imageId, '.jpg', imageBuffer);
+      await this.storageRepository.createFile(remoteImagePath, imageBuffer);
+      if (!(await this.storageRepository.checkFileExists(remoteImagePath))) throw new Error('remote synthetic image missing after create');
       const imageResult = await this.assetMediaService.uploadAsset(
         auth,
         { fileCreatedAt: now, fileModifiedAt: now, filename: 'remote-canary-image.jpg', isFavorite: false, assetData: undefined } as unknown as AssetMediaCreateDto,
-        this.makeUploadFile(imagePath, imageBuffer, 'remote-canary-image.jpg', imageId),
+        this.makeUploadFile(remoteImagePath, imageBuffer, 'remote-canary-image.jpg', imageId),
       );
       this.logger.log(`Remote real image upload PASS: ${imageResult.id} (${imageResult.status})`);
 
-      const directPreview = `/remote/photo-extern/.immich-router-canary/${imageId}-preview.jpeg`;
-      await this.mediaRepository.generateThumbnail(imagePath, { format: 'jpeg' as any, quality: 80, colorspace: 'srgb', processInvalidImages: false }, directPreview);
+      const directPreview = `${root}/${imageId}-preview.jpeg`;
+      await this.mediaRepository.generateThumbnail(remoteImagePath, { format: 'jpeg' as any, quality: 80, colorspace: 'srgb', processInvalidImages: false }, directPreview);
       const previewStat = await this.storageRepository.stat(directPreview);
       if (previewStat.size <= 0) throw new Error('remote thumbnail was empty');
       this.logger.log(`Remote staged thumbnail PASS: ${directPreview} (${previewStat.size} bytes)`);
@@ -121,22 +123,22 @@ export class RemoteStorageTestService {
         '-t', '1', '-an', '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-movflags', '+faststart', '-y', tmpVideo,
       ]);
       const videoBuffer = await readFile(tmpVideo);
-      const videoPath = await this.writeSyntheticAsset(auth.user.id, videoId, '.mp4', videoBuffer);
+      await this.storageRepository.createFile(remoteVideoPath, videoBuffer);
+      if (!(await this.storageRepository.checkFileExists(remoteVideoPath))) throw new Error('remote synthetic video missing after create');
       const videoResult = await this.assetMediaService.uploadAsset(
         auth,
         { fileCreatedAt: now, fileModifiedAt: now, filename: 'remote-canary-video.mp4', isFavorite: false, duration: 1000, assetData: undefined } as unknown as AssetMediaCreateDto,
-        this.makeUploadFile(videoPath, videoBuffer, 'remote-canary-video.mp4', videoId),
+        this.makeUploadFile(remoteVideoPath, videoBuffer, 'remote-canary-video.mp4', videoId),
       );
       this.logger.log(`Remote real video upload PASS: ${videoResult.id} (${videoResult.status})`);
 
-      await this.storageRepository.createFile(remoteVideoPath, videoBuffer);
       const remoteProbe = await this.mediaRepository.probe(remoteVideoPath);
       if (remoteProbe.videoStreams.length === 0 || remoteProbe.format.duration <= 0) throw new Error('remote video probe returned no valid video stream');
       this.logger.log(`Remote video probe PASS: ${remoteProbe.format.duration.toFixed(2)}s ${remoteProbe.videoStreams[0].width}x${remoteProbe.videoStreams[0].height}`);
-      await this.storageRepository.unlink(remoteVideoPath);
     } catch (error) {
       this.logger.error(`Remote real media canary FAIL: ${(error as Error).message}`, (error as Error).stack);
       await this.storageRepository.unlink(remoteMlImagePath).catch(() => undefined);
+      await this.storageRepository.unlink(remoteImagePath).catch(() => undefined);
       await this.storageRepository.unlink(remoteVideoPath).catch(() => undefined);
     } finally {
       await rm(tmpVideo, { force: true }).catch(() => undefined);
@@ -167,14 +169,6 @@ export class RemoteStorageTestService {
     } catch (error) {
       throw new Error(`Remote ML canary failed: ${(error as Error).message}`);
     }
-  }
-
-  private async writeSyntheticAsset(userId: string, uuid: string, extension: string, data: Buffer) {
-    const folder = StorageCore.getNestedFolder(StorageFolder.Upload, userId, uuid);
-    this.storageRepository.mkdirSync(folder);
-    const path = `${folder}/${uuid}${extension}`;
-    await this.storageRepository.createFile(path, data);
-    return path;
   }
 
   private makeUploadFile(path: string, data: Buffer, originalName: string, uuid: string) {
