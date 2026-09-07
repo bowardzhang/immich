@@ -6,11 +6,11 @@ import { InjectKysely } from 'nestjs-kysely';
 import { Kysely } from 'kysely';
 import { OnEvent } from 'src/decorators';
 import { BootstrapEventPriority, ImmichWorker } from 'src/enum';
+import { ConfigRepository } from 'src/repositories/config.repository';
 import { DB } from 'src/schema';
 import { LoggingRepository } from 'src/repositories/logging.repository';
 import { StorageRepository } from 'src/repositories/storage.repository';
 
-const LOCAL_PREFIXES = ['/data/', '/usr/src/app/upload/'];
 const REMOTE_PREFIX = '/remote/photo-extern/';
 const BATCH_SIZE = 25;
 
@@ -19,7 +19,6 @@ interface MigrationFile {
   kind: 'original' | 'asset-file';
   path: string;
   target: string;
-  expectedSize?: number;
   expectedSha1?: string;
 }
 
@@ -30,6 +29,7 @@ export class RemoteStorageMigrationService {
   constructor(
     @InjectKysely() private db: Kysely<DB>,
     private storageRepository: StorageRepository,
+    private configRepository: ConfigRepository,
     private logger: LoggingRepository,
   ) {
     this.logger.setContext(RemoteStorageMigrationService.name);
@@ -42,23 +42,17 @@ export class RemoteStorageMigrationService {
       this.logger.error('Legacy media migration requested but REMOTE_STORAGE_URL is missing');
       return;
     }
-    if (process.env.I_WORKER && process.env.I_WORKER !== ImmichWorker.Api) return;
-
-    // Run only once for this process and give StorageService/bootstrap a chance to settle.
+    if (this.configRepository.getWorker() !== ImmichWorker.Api) return;
     if (this.running) return;
+
+    // Run only once for the API process and give StorageService/bootstrap a chance to settle.
     this.running = true;
     setTimeout(() => void this.migrate(), 5_000).unref();
   }
 
-  private isLocalPath(path: string): boolean {
-    return LOCAL_PREFIXES.some((prefix) => path.startsWith(prefix));
-  }
-
   private targetFor(path: string): string {
-    const prefix = LOCAL_PREFIXES.find((candidate) => path.startsWith(candidate));
-    if (!prefix) throw new Error(`Unsupported migration path: ${path}`);
-    const relative = path.slice(prefix.length);
-    return `${REMOTE_PREFIX}${relative}`;
+    if (!path.startsWith('/data/')) throw new Error(`Unsupported migration path: ${path}`);
+    return `${REMOTE_PREFIX}${path.slice('/data/'.length)}`;
   }
 
   private async collectFiles(): Promise<MigrationFile[]> {
@@ -124,8 +118,9 @@ export class RemoteStorageMigrationService {
     const remoteHash = createHash('sha1');
     let remoteSize = 0;
     for await (const chunk of this.storageRepository.createPlainReadStream(file.target)) {
-      remoteHash.update(chunk as Buffer);
-      remoteSize += (chunk as Buffer).length;
+      const data = chunk as Buffer;
+      remoteHash.update(data);
+      remoteSize += data.length;
     }
     const remoteSha1 = remoteHash.digest('hex');
     if (remoteSize !== sourceStat.size || remoteSha1 !== sha1) {
@@ -139,14 +134,18 @@ export class RemoteStorageMigrationService {
     if (file.kind === 'original') {
       await this.db.updateTable('asset').set({ originalPath: file.target }).where('id', '=', file.assetId).execute();
     } else {
-      await this.db.updateTable('asset_file').set({ path: file.target }).where('assetId', '=', file.assetId).where('path', '=', file.path).execute();
+      await this.db
+        .updateTable('asset_file')
+        .set({ path: file.target })
+        .where('assetId', '=', file.assetId)
+        .where('path', '=', file.path)
+        .execute();
     }
   }
 
   private async migrate() {
     try {
       const files = await this.collectFiles();
-      const totalBytes = files.reduce((sum, file) => sum + (file.expectedSize ?? 0), 0);
       this.logger.log(`Legacy media migration discovered ${files.length} database-referenced local files`);
 
       let completed = 0;
@@ -173,7 +172,7 @@ export class RemoteStorageMigrationService {
         }
       }
 
-      this.logger.log(`Legacy media migration finished: completed=${completed}, failed=${failed}, bytes=${bytes}, plannedBytes=${totalBytes}`);
+      this.logger.log(`Legacy media migration finished: completed=${completed}, failed=${failed}, bytes=${bytes}`);
       if (failed === 0) this.logger.log('Legacy media migration COMPLETE: all referenced local media were verified and moved');
       else this.logger.warn(`Legacy media migration INCOMPLETE: ${failed} files remain on local storage and must be retried`);
     } catch (error) {
