@@ -14,6 +14,7 @@ import { UserRepository } from 'src/repositories/user.repository';
 import { MediaRepository } from 'src/repositories/media.repository';
 import { AssetMediaService } from 'src/services/asset-media.service';
 import { AssetMediaCreateDto } from 'src/dtos/asset-media.dto';
+import { MachineLearningRepository } from 'src/repositories/machine-learning.repository';
 
 const execFileAsync = promisify(execFile);
 
@@ -25,6 +26,7 @@ export class RemoteStorageTestService {
     private userRepository: UserRepository,
     private configRepository: ConfigRepository,
     private mediaRepository: MediaRepository,
+    private machineLearningRepository: MachineLearningRepository,
     private logger: LoggingRepository,
   ) {
     this.logger.setContext(RemoteStorageTestService.name);
@@ -105,6 +107,8 @@ export class RemoteStorageTestService {
       if (previewStat.size <= 0) throw new Error('remote thumbnail was empty');
       this.logger.log(`Remote staged thumbnail PASS: ${directPreview} (${previewStat.size} bytes)`);
 
+      await this.runMachineLearningCanary(imagePath);
+
       const r = Math.floor(Math.random() * 255);
       const g = Math.floor(Math.random() * 255);
       const b = Math.floor(Math.random() * 255);
@@ -132,6 +136,32 @@ export class RemoteStorageTestService {
       await this.storageRepository.unlink(remoteVideoPath).catch(() => undefined);
     } finally {
       await rm(tmpVideo, { force: true }).catch(() => undefined);
+    }
+  }
+
+  private async runMachineLearningCanary(imagePath: string) {
+    try {
+      const config = this.configRepository.getMachineLearningConfig();
+      if (!config.enabled) {
+        this.logger.log('Remote ML canary SKIP: machine learning is disabled');
+        return;
+      }
+
+      const clip = await this.machineLearningRepository.encodeImage(imagePath, config.clip);
+      if (!clip) throw new Error('CLIP returned an empty embedding');
+      this.logger.log(`Remote ML CLIP PASS (${clip.length} chars)`);
+
+      if (config.facialRecognition.enabled) {
+        const faces = await this.machineLearningRepository.detectFaces(imagePath, config.facialRecognition);
+        this.logger.log(`Remote ML face detection PASS (${faces.faces.length} faces)`);
+      }
+
+      if (config.ocr.enabled) {
+        const ocr = await this.machineLearningRepository.ocr(imagePath, config.ocr);
+        this.logger.log(`Remote ML OCR PASS (${ocr.text.length} text regions)`);
+      }
+    } catch (error) {
+      throw new Error(`Remote ML canary failed: ${(error as Error).message}`);
     }
   }
 
