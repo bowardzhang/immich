@@ -208,6 +208,7 @@ export class ServerService extends BaseService {
       serverStats.usage += usage.usage;
       serverStats.usagePhotos += usage.usagePhotos;
       serverStats.usageVideos += usage.usageVideos;
+
       serverStats.usageByUser.push(usage);
     }
 
@@ -216,18 +217,21 @@ export class ServerService extends BaseService {
 
   getSupportedMediaTypes(): ServerMediaTypesResponseDto {
     return {
-      video: mimeTypes.video,
-      image: mimeTypes.image,
-      sidecar: mimeTypes.sidecar,
+      video: Object.keys(mimeTypes.video),
+      image: Object.keys(mimeTypes.image),
+      sidecar: Object.keys(mimeTypes.sidecar),
     };
+  }
+
+  async deleteLicense(): Promise<void> {
+    await this.systemMetadataRepository.delete(SystemMetadataKey.License);
   }
 
   async getLicense(): Promise<LicenseResponseDto> {
     const license = await this.systemMetadataRepository.get(SystemMetadataKey.License);
     if (!license) {
-      throw new NotFoundException('No license registered');
+      throw new NotFoundException();
     }
-
     return license;
   }
 
@@ -235,12 +239,20 @@ export class ServerService extends BaseService {
     if (!dto.licenseKey.startsWith('IMSV-')) {
       throw new BadRequestException('Invalid license key');
     }
-    const license = { licenseKey: dto.licenseKey, activationKey: dto.activationKey };
-    await this.systemMetadataRepository.set(SystemMetadataKey.License, license);
-    return license;
-  }
+    const { licensePublicKey } = this.configRepository.getEnv();
+    const isLicenseValid = this.cryptoRepository.verifySha256(
+      dto.licenseKey,
+      dto.activationKey,
+      licensePublicKey.server,
+    );
+    if (!isLicenseValid) {
+      throw new BadRequestException('Invalid license key');
+    }
 
-  async deleteLicense(): Promise<void> {
-    await this.systemMetadataRepository.delete(SystemMetadataKey.License);
+    const licenseData = { ...dto, activatedAt: new Date() };
+
+    await this.systemMetadataRepository.set(SystemMetadataKey.License, licenseData);
+
+    return licenseData;
   }
 }
