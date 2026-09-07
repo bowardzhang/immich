@@ -13,16 +13,17 @@ jobs:
   integration-test:
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    env:
-      REMOTE_STORAGE_TOKEN: ${{ secrets.REMOTE_STORAGE_TOKEN }}
-      STORAGE_ROUTER_URL: https://storage-router-production.up.railway.app
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Run Storage Router lifecycle test
-        shell: pwsh
-        run: ./storage-router/test-storage.ps1
-
       - name: Run local multi-volume routing test
         run: node ./storage-router/test-multi-volume.mjs
+
+      - name: Run production Storage Router lifecycle test
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        shell: pwsh
+        env:
+          REMOTE_STORAGE_TOKEN: ${{ secrets.REMOTE_STORAGE_TOKEN }}
+          STORAGE_ROUTER_URL: https://storage-router-production.up.railway.app
+        run: ./storage-router/test-storage.ps1
