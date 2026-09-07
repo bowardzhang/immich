@@ -235,7 +235,7 @@ export class ServerService extends BaseService {
     return license;
   }
 
-  async setLicense(dto: LicenseKeyDto): Promise<ServerStorageResponseDto | LicenseResponseDto> {
+  async setLicense(dto: LicenseKeyDto): Promise<LicenseResponseDto> {
     if (!dto.licenseKey.startsWith('IMSV-')) {
       throw new BadRequestException('Invalid license key');
     }
