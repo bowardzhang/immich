@@ -4,7 +4,6 @@ import { createReadStream, createWriteStream } from 'node:fs';
 import { mkdtemp, rm, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { PassThrough } from 'node:stream';
-import { pipeline } from 'node:stream/promises';
 
 const PORT = Number(process.env.PORT || 8080);
 const TOKEN = process.env.REMOTE_STORAGE_TOKEN || '';
@@ -114,37 +113,6 @@ async function candidateNodes(requiredBytes = 0, exclude = new Set()) {
     .sort((a, b) => b.status.availableBytes - a.status.availableBytes);
 }
 
-async function chooseNode(relative, requiredBytes = 0) {
-  const existing = await findFile(relative);
-  if (existing) return existing.node;
-  const candidates = await candidateNodes(requiredBytes);
-  if (candidates.length === 0) throw new Error(`No healthy storage volume has enough free space for this file (required=${requiredBytes} bytes plus ${ALLOCATION_SAFETY_BYTES} bytes safety margin)`);
-  return candidates[0].node;
-}
-
-async function spoolRequestBody(req, contentLength) {
-  if (Number.isFinite(contentLength) && contentLength > MAX_UPLOAD_SPOOL_BYTES) {
-    throw new Error(`Upload exceeds STORAGE_MAX_UPLOAD_SPOOL_BYTES (${MAX_UPLOAD_SPOOL_BYTES} bytes)`);
-  }
-  const dir = await mkdtemp(`${tmpdir()}/storage-router-upload-`);
-  const file = `${dir}/payload.bin`;
-  try {
-    await pipeline(req, createWriteStream(file));
-    const fileStat = await stat(file);
-    const actualBytes = fileStat.size;
-    if (actualBytes > MAX_UPLOAD_SPOOL_BYTES) {
-      throw new Error(`Upload exceeds STORAGE_MAX_UPLOAD_SPOOL_BYTES (${MAX_UPLOAD_SPOOL_BYTES} bytes)`);
-    }
-    if (contentLength > 0 && actualBytes !== contentLength) {
-      throw new Error(`Upload size mismatch: declared=${contentLength} bytes actual=${actualBytes} bytes`);
-    }
-    return { dir, file, actualBytes };
-  } catch (error) {
-    await rm(dir, { recursive: true, force: true }).catch(() => {});
-    throw error;
-  }
-}
-
 async function putWithFailover(relative, spoolFile, headersIn, requiredBytes = 0, exclude = new Set()) {
   const candidates = await candidateNodes(requiredBytes, exclude);
   if (candidates.length === 0) throw new Error('No healthy storage volume is currently eligible for this write');
@@ -211,9 +179,19 @@ async function streamPutWithSpoolFailover(relative, req, contentLength = 0) {
     req.pipe(spool);
     req.pipe(upstreamBody);
     await new Promise((resolve, reject) => {
-      spool.once('finish', resolve);
-      spool.once('error', reject);
-      req.once('error', reject);
+      const cleanup = () => {
+        spool.off('finish', onFinish);
+        spool.off('error', onError);
+        req.off('error', onError);
+        req.off('aborted', onAborted);
+      };
+      const onFinish = () => { cleanup(); resolve(); };
+      const onError = (error) => { cleanup(); reject(error); };
+      const onAborted = () => { cleanup(); reject(new Error('Client aborted upload')); };
+      spool.once('finish', onFinish);
+      spool.once('error', onError);
+      req.once('error', onError);
+      req.once('aborted', onAborted);
     });
 
     const fileStat = await stat(file);
@@ -244,9 +222,14 @@ async function streamPutWithSpoolFailover(relative, req, contentLength = 0) {
     console.log(JSON.stringify({ event: 'storage-put', mode: 'spool-failover', node: node.name, primary: primary.name, bytes: actualBytes, durationMs: Date.now() - startedAt, primaryError: primaryResult.error?.message || (primaryResult.upstream ? `${primaryResult.upstream.status} ${primaryResult.upstream.statusText}` : null) }));
     return { node, upstream, dir, file, actualBytes };
   } catch (error) {
+    req.unpipe(spool);
     req.unpipe(upstreamBody);
     upstreamBody.destroy();
     if (!spool.destroyed) spool.destroy();
+    let partialBytes = 0;
+    try { partialBytes = (await stat(file)).size; } catch {}
+    console.warn(JSON.stringify({ event: 'storage-put', mode: 'aborted-or-error', node: primary.name, partialBytes, durationMs: Date.now() - startedAt, error: error instanceof Error ? error.message : String(error) }));
+    await rm(dir, { recursive: true, force: true }).catch(() => {});
     throw error;
   }
 }
