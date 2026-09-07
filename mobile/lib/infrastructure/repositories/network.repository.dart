@@ -26,8 +26,8 @@ class NetworkRepository {
         clientPointer,
         configuration: const OkHttpClientConfiguration(
           connectTimeout: Duration(seconds: 30),
-          readTimeout: Duration(seconds: 60),
-          writeTimeout: Duration(seconds: 60),
+          readTimeout: Duration(seconds: 240),
+          writeTimeout: Duration(seconds: 240),
         ),
       );
     }
