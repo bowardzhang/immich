@@ -1,7 +1,6 @@
 import { Injectable } from '@nestjs/common';
-import { constants, createReadStream, createWriteStream } from 'node:fs';
+import { constants, createReadStream } from 'node:fs';
 import fs from 'node:fs/promises';
-import os from 'node:os';
 import path from 'node:path';
 import { PassThrough, Readable, Writable } from 'node:stream';
 import picomatch from 'picomatch';
@@ -56,7 +55,33 @@ export class RemoteStorageRepository {
   createPlainReadStream(filepath: string): Readable { const output = new PassThrough(); void this.request(this.buildUrl('file', this.relativePath(filepath)), { method: 'GET', timeoutMs: null }).then((response) => { if (!response.body) throw new Error(`Remote storage returned an empty response for ${filepath}`); Readable.fromWeb(response.body as import('node:stream/web').ReadableStream).pipe(output); }).catch((error) => output.destroy(error as Error)); return output; }
   async readFile(filepath: string): Promise<Buffer> { const response = await this.request(this.buildUrl('file', this.relativePath(filepath)), { method: 'GET', timeoutMs: null }); return Buffer.from(await response.arrayBuffer()); }
   async createFile(filepath: string, buffer: Buffer) { const body = new Uint8Array(buffer) as unknown as BodyInit; await this.request(this.buildUrl('file', this.relativePath(filepath)), { method: 'PUT', body, timeoutMs: null, headers: { 'content-length': String(buffer.length), 'content-type': mimeTypes.lookup(filepath) } }); }
-  createWriteStream(filepath: string): Writable { const relative = this.relativePath(filepath); const temp = path.join(os.tmpdir(), `immich-remote-${Date.now()}-${Math.random().toString(36).slice(2)}.tmp`); const local = createWriteStream(temp, { flags: 'wx' }); return new Writable({ write: (chunk, encoding, callback) => { if (!local.write(chunk, encoding)) local.once('drain', callback); else callback(); }, final: (callback) => { local.end(async () => { try { await this.uploadFile(temp, `${this.prefix}/${relative}`); callback(); } catch (error) { callback(error as Error); } finally { await fs.rm(temp, { force: true }); } }); }, destroy: (_error, callback) => { local.destroy(); void fs.rm(temp, { force: true }).then(() => callback()).catch(callback); } }); }
+  createWriteStream(filepath: string): Writable {
+    const relative = this.relativePath(filepath);
+    const input = new PassThrough();
+    const body = Readable.toWeb(input) as unknown as BodyInit;
+    const upload = this.request(this.buildUrl('file', relative), {
+      method: 'PUT',
+      body,
+      duplex: 'half',
+      timeoutMs: null,
+      headers: { 'content-type': mimeTypes.lookup(filepath) },
+    }).then(async (response) => { await response.arrayBuffer(); });
+    upload.catch((error) => input.destroy(error as Error));
+    return new Writable({
+      write: (chunk, encoding, callback) => {
+        if (!input.write(chunk, encoding)) input.once('drain', callback);
+        else callback();
+      },
+      final: (callback) => {
+        input.end();
+        upload.then(() => callback()).catch((error) => callback(error as Error));
+      },
+      destroy: (error, callback) => {
+        input.destroy(error || undefined);
+        callback();
+      },
+    });
+  }
   async createOrOverwriteFile(filepath: string, buffer: Buffer) { return this.createFile(filepath, buffer); }
   async overwriteFile(filepath: string, buffer: Buffer) { return this.createFile(filepath, buffer); }
   async rename(source: string, target: string) { await this.request(this.buildUrl('file', this.relativePath(target), false, this.relativePath(source)), { method: 'MOVE' }); }
