@@ -60,6 +60,7 @@ export class ServerController {
     history: new HistoryBuilder().added('v1').beta('v1').stable('v2'),
   })
   getStorage(): Promise<ServerStorageResponseDto> {
+    console.log('[status-debug] GET /api/server/storage reached controller');
     return this.service.getStorage();
   }
 
@@ -80,7 +81,9 @@ export class ServerController {
     history: new HistoryBuilder().added('v1').beta('v1').stable('v2'),
   })
   getServerVersion(): ServerVersionResponseDto {
-    return this.versionService.getVersion();
+    const version = this.versionService.getVersion();
+    console.log(`[status-debug] GET /api/server/version reached controller: ${JSON.stringify(version)}`);
+    return version;
   }
 
   @Get('version-history')
@@ -162,7 +165,7 @@ export class ServerController {
   @HttpCode(HttpStatus.NO_CONTENT)
   @Endpoint({
     summary: 'Delete server product key',
-    description: 'Delete the currently set server product key.',
+    description: 'Delete the currently set product key.',
     history: new HistoryBuilder().added('v1').beta('v1').stable('v2'),
   })
   deleteServerLicense(): Promise<void> {
