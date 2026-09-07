@@ -118,7 +118,10 @@ async function createStorageService(index) {
     {
       input: {
         projectId: PROJECT_ID,
+        environmentId: ENVIRONMENT_ID,
         name,
+        source: { repo: REPO },
+        branch: BRANCH,
         variables: {
           REMOTE_STORAGE_TOKEN,
           PORT: '8080',
@@ -127,19 +130,6 @@ async function createStorageService(index) {
     },
   );
   return { id: data.serviceCreate.id, name };
-}
-
-async function connectStorageService(serviceId) {
-  await gql(
-    `mutation serviceConnect($id: String!, $input: ServiceConnectInput!) { serviceConnect(id: $id, input: $input) { id } }`,
-    {
-      id: serviceId,
-      input: {
-        repo: REPO,
-        branch: BRANCH,
-      },
-    },
-  );
 }
 
 async function configureService(serviceId) {
@@ -292,8 +282,6 @@ export async function ensureNextVolume(currentNodes, force = false) {
       console.log(JSON.stringify({ event: 'storage-provision', action: 'reuse-service', index, serviceId: service.id }));
     }
 
-    await connectStorageService(service.id);
-    console.log(JSON.stringify({ event: 'storage-provision', action: 'connect-source', index, serviceId: service.id, repo: REPO, branch: BRANCH }));
     await configureService(service.id);
     const volume = await createOrReuseVolume(service.id, index);
     console.log(JSON.stringify({ event: 'storage-provision', action: 'volume-ready', index, serviceId: service.id, volumeId: volume.id }));
