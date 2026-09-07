@@ -1,9 +1,11 @@
 import http from 'node:http';
 import { spawn } from 'node:child_process';
+import { Readable } from 'node:stream';
 
 const TOKEN = 'local-test-token';
 const volumes = [new Map(), new Map()];
 const capacities = [1000, 10000];
+const failNextPut = [false, false];
 
 function startMock(index) {
   const server = http.createServer(async (req, res) => {
@@ -22,6 +24,11 @@ function startMock(index) {
       return req.method === 'HEAD' ? res.end() : res.end(body);
     }
     if (req.method === 'PUT' && url.pathname === '/api/file') {
+      if (failNextPut[index]) {
+        failNextPut[index] = false;
+        res.writeHead(503).end('simulated write failure');
+        return;
+      }
       const chunks = [];
       for await (const chunk of req) chunks.push(chunk);
       store.set(path, Buffer.concat(chunks));
@@ -104,11 +111,27 @@ try {
   assert(volumes[0].has('new/on-volume-2.txt') === false, 'new file incorrectly allocated to volume 1');
   assert(volumes[1].has('new/on-volume-2.txt'), 'new file was not allocated to volume 2');
 
+  // Chunked uploads without Content-Length must stream successfully to the primary volume.
+  const chunkedPath = 'new/chunked-stream.txt';
+  const chunkedBody = Readable.from([Buffer.from('chunked-'), Buffer.from('stream')]);
+  r = await request(base, chunkedPath, { method: 'PUT', body: chunkedBody, duplex: 'half' });
+  assert(r.status === 201, `chunked PUT returned ${r.status}`);
+  assert(volumes[1].get(chunkedPath)?.toString() === 'chunked-stream', 'chunked upload content mismatch');
+
+  // If the streamed primary write fails, the completed spool must be replayed to another eligible volume.
+  const failoverPath = 'new/stream-failover.txt';
+  failNextPut[1] = true;
+  const failoverBody = Readable.from([Buffer.from('stream-'), Buffer.from('failover')]);
+  r = await request(base, failoverPath, { method: 'PUT', body: failoverBody, duplex: 'half' });
+  assert(r.status === 201, `stream failover PUT returned ${r.status}`);
+  assert(!volumes[1].has(failoverPath), 'failed primary unexpectedly retained the failover file');
+  assert(volumes[0].get(failoverPath)?.toString() === 'stream-failover', 'spool failover did not preserve upload content');
+
   // LIST must merge both volumes.
   r = await fetch(`${base}/api/list?path=&recursive=true`, { headers: { authorization: `Bearer ${TOKEN}` } });
   const listed = await r.json();
   const paths = new Set(listed.entries.map((e) => e.path));
-  assert(paths.has('existing/on-volume-1.txt') && paths.has('new/on-volume-2.txt'), 'merged LIST is incomplete');
+  assert(paths.has('existing/on-volume-1.txt') && paths.has('new/on-volume-2.txt') && paths.has(chunkedPath) && paths.has(failoverPath), 'merged LIST is incomplete');
 
   // Cross-volume MOVE: source on volume 1 -> destination selected on volume 2.
   const moveTarget = 'moved/to-volume-2.txt';
