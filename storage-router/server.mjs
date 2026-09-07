@@ -3,6 +3,7 @@ import crypto from 'node:crypto';
 import { createReadStream, createWriteStream } from 'node:fs';
 import { mkdtemp, rm, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
+import { PassThrough } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 
 const PORT = Number(process.env.PORT || 8080);
@@ -144,8 +145,8 @@ async function spoolRequestBody(req, contentLength) {
   }
 }
 
-async function putWithFailover(relative, spoolFile, headersIn, requiredBytes = 0) {
-  const candidates = await candidateNodes(requiredBytes);
+async function putWithFailover(relative, spoolFile, headersIn, requiredBytes = 0, exclude = new Set()) {
+  const candidates = await candidateNodes(requiredBytes, exclude);
   if (candidates.length === 0) throw new Error('No healthy storage volume is currently eligible for this write');
   let lastError;
   for (const { node } of candidates) {
@@ -165,6 +166,89 @@ async function putWithFailover(relative, spoolFile, headersIn, requiredBytes = 0
     console.warn(`PUT failover: ${node.name} failed; trying next eligible volume`);
   }
   throw lastError || new Error('All storage volumes rejected the write');
+}
+
+async function streamPutWithSpoolFailover(relative, req, contentLength = 0) {
+  if (contentLength > MAX_UPLOAD_SPOOL_BYTES) {
+    throw new Error(`Upload exceeds STORAGE_MAX_UPLOAD_SPOOL_BYTES (${MAX_UPLOAD_SPOOL_BYTES} bytes)`);
+  }
+
+  const candidates = await candidateNodes(contentLength);
+  if (candidates.length === 0) throw new Error('No healthy storage volume is currently eligible for this write');
+  const primary = candidates[0].node;
+  const dir = await mkdtemp(`${tmpdir()}/storage-router-upload-`);
+  const file = `${dir}/payload.bin`;
+  const startedAt = Date.now();
+  const spool = createWriteStream(file);
+  const upstreamBody = new PassThrough();
+  const contentType = req.headers['content-type'] || 'application/octet-stream';
+  const primaryHeaders = {
+    'content-type': contentType,
+    ...(contentLength > 0 ? { 'content-length': String(contentLength) } : {}),
+  };
+
+  let primarySettled = false;
+  const primaryPromise = request(primary, `/api/file?path=${encodeURIComponent(relative)}`, {
+    method: 'PUT',
+    body: upstreamBody,
+    duplex: 'half',
+    headers: primaryHeaders,
+  }).then((upstream) => {
+    primarySettled = true;
+    if (!upstream.ok && upstream.status >= 500) {
+      req.unpipe(upstreamBody);
+      upstreamBody.destroy();
+    }
+    return { upstream, error: null };
+  }).catch((error) => {
+    primarySettled = true;
+    req.unpipe(upstreamBody);
+    upstreamBody.destroy();
+    return { upstream: null, error };
+  });
+
+  try {
+    req.pipe(spool);
+    req.pipe(upstreamBody);
+    await new Promise((resolve, reject) => {
+      spool.once('finish', resolve);
+      spool.once('error', reject);
+      req.once('error', reject);
+    });
+
+    const fileStat = await stat(file);
+    const actualBytes = fileStat.size;
+    if (actualBytes > MAX_UPLOAD_SPOOL_BYTES) {
+      req.unpipe(upstreamBody);
+      upstreamBody.destroy();
+      throw new Error(`Upload exceeds STORAGE_MAX_UPLOAD_SPOOL_BYTES (${MAX_UPLOAD_SPOOL_BYTES} bytes)`);
+    }
+    if (contentLength > 0 && actualBytes !== contentLength) {
+      req.unpipe(upstreamBody);
+      upstreamBody.destroy();
+      throw new Error(`Upload size mismatch: declared=${contentLength} bytes actual=${actualBytes} bytes`);
+    }
+
+    if (!primarySettled) upstreamBody.end();
+    const primaryResult = await primaryPromise;
+    if (primaryResult.upstream && (primaryResult.upstream.ok || primaryResult.upstream.status < 500)) {
+      console.log(JSON.stringify({ event: 'storage-put', mode: 'streamed-primary', node: primary.name, bytes: actualBytes, durationMs: Date.now() - startedAt }));
+      return { node: primary, upstream: primaryResult.upstream, dir, file, actualBytes };
+    }
+
+    const failoverHeaders = {
+      'content-type': contentType,
+      'content-length': String(actualBytes),
+    };
+    const { node, upstream } = await putWithFailover(relative, file, failoverHeaders, actualBytes, new Set([primary]));
+    console.log(JSON.stringify({ event: 'storage-put', mode: 'spool-failover', node: node.name, primary: primary.name, bytes: actualBytes, durationMs: Date.now() - startedAt, primaryError: primaryResult.error?.message || (primaryResult.upstream ? `${primaryResult.upstream.status} ${primaryResult.upstream.statusText}` : null) }));
+    return { node, upstream, dir, file, actualBytes };
+  } catch (error) {
+    req.unpipe(upstreamBody);
+    upstreamBody.destroy();
+    if (!spool.destroyed) spool.destroy();
+    throw error;
+  }
 }
 
 function json(res, status, body) {
@@ -311,16 +395,11 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'PUT' && url.pathname === '/api/file') {
       const declaredBytes = Number(req.headers['content-length'] || 0);
       const contentLength = Number.isFinite(declaredBytes) && declaredBytes > 0 ? declaredBytes : 0;
-      const { dir, file, actualBytes } = await spoolRequestBody(req, contentLength);
+      const result = await streamPutWithSpoolFailover(relative, req, contentLength);
       try {
-        const headersIn = {
-          'content-type': req.headers['content-type'] || 'application/octet-stream',
-          'content-length': String(actualBytes),
-        };
-        const { upstream } = await putWithFailover(relative, file, headersIn, actualBytes);
-        return proxyResponse(res, upstream);
+        return proxyResponse(res, result.upstream);
       } finally {
-        await rm(dir, { recursive: true, force: true }).catch(() => {});
+        await rm(result.dir, { recursive: true, force: true }).catch(() => {});
       }
     }
     if (req.method === 'DELETE' && url.pathname === '/api/file') {
