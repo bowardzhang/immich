@@ -59,12 +59,32 @@ const sendRemoteFile = async (res: Response, path: string): Promise<void> => {
   if (range) headers.range = range;
 
   const response = await fetch(`${baseUrl}/api/file?path=${encodedPath}`, { headers });
-  if (!response.ok) throw new Error(`Remote media request failed: ${response.status} ${response.statusText}`);
+  const responseHeaders = ['content-type', 'content-length', 'content-range', 'accept-ranges', 'etag', 'last-modified'];
 
+  // Preserve upstream status (especially 206 and 416) instead of converting a
+  // valid Range response into Immich's generic 404 error handling.
   res.status(response.status);
-  for (const header of ['content-type', 'content-length', 'content-range', 'accept-ranges', 'etag', 'last-modified']) {
+  for (const header of responseHeaders) {
     const value = response.headers.get(header);
     if (value) res.set(header, value);
+  }
+
+  if (!response.ok) {
+    if (response.body) {
+      const reader = response.body.getReader();
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          if (!res.write(Buffer.from(value))) await new Promise((resolve) => res.once('drain', resolve));
+        }
+      } finally {
+        res.end();
+      }
+    } else {
+      res.end();
+    }
+    return;
   }
 
   if (!response.body) {
