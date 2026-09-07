@@ -94,9 +94,13 @@ class ForegroundUploadService {
     if (useSequentialUpload) {
       await _uploadSequentially(items: candidates, cancelToken: cancelToken, hasWifi: hasWifi, callbacks: callbacks);
     } else {
+      // Railway's public HTTP proxy has a finite request lifetime. Serializing automatic
+      // backups gives large photos/videos the full uplink instead of splitting bandwidth
+      // across three simultaneous multipart uploads and reduces proxy/client timeouts.
       await _executeWithWorkerPool<LocalAsset>(
         items: candidates,
         cancelToken: cancelToken,
+        concurrentWorkers: 1,
         shouldSkip: (asset) {
           final requireWifi = _shouldRequireWiFi(asset);
           return requireWifi && !hasWifi;
