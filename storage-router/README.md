@@ -1,12 +1,8 @@
-# Immich Storage Router
+# Immich Storage Router 中文文档
 
-[![Storage Router CI](https://img.shields.io/github/actions/workflow/status/bowardzhang/immich/storage-router-test.yml?branch=3.1.0-remote&label=storage-router)](https://github.com/bowardzhang/immich/actions/workflows/storage-router-test.yml)
-[![Branch](https://img.shields.io/badge/branch-3.1.0--remote-3F51B5)](https://github.com/bowardzhang/immich/tree/3.1.0-remote)
-[![License](https://img.shields.io/badge/license-AGPL--3.0-blue)](https://opensource.org/license/agpl-v3)
+Storage Router 是本 Fork 最核心的定制服务：它把多个各自挂载一个 Railway Persistent Volume 的 `Photo Storage N` 服务组合成一个逻辑 HTTP 媒体存储池，供 Immich Server 使用。
 
-Storage Router is the core fork-specific service in this repository. It presents multiple one-volume Photo Storage services to Immich as one logical HTTP-backed media pool.
-
-## Architecture
+## 架构
 
 ```mermaid
 flowchart LR
@@ -21,24 +17,24 @@ flowchart LR
     SN --> VN[(Volume N)]
 ```
 
-Immich stores stable logical media paths. Storage Router decides which physical volume contains a file and exposes aggregate capacity back to Immich.
+Immich 保存稳定的逻辑媒体路径；Storage Router 决定文件实际位于哪个 Volume，并向 Immich 返回整个存储池的聚合容量。
 
-## Design properties
+## 设计特性
 
-| Property | Behavior |
+| 特性 | 行为 |
 |---|---|
-| Stateless routing metadata | No separate routing database |
-| New-file placement | Healthy node with the most available space |
-| Existing-file lookup | Probe configured nodes by logical path |
-| Upload failure | Retry another eligible node |
-| Same-node move | Local move where possible |
-| Cross-node move | Copy first, delete source only after success |
-| Capacity source | Real filesystem `statfs` values |
-| Expansion | Automatic Railway `Photo Storage N` provisioning |
-| Alerts | Resend warning / critical email |
-| Default node limit | 10 |
+| 路由元数据 | 无单独路由数据库 |
+| 新文件分配 | 选择剩余空间最多的健康节点 |
+| 已有文件定位 | 按逻辑路径查询已配置节点 |
+| 上传失败 | 使用临时 spool 向其他可用节点 failover |
+| 同节点 MOVE | 尽量本地移动 |
+| 跨节点 MOVE | 先复制成功，再删除源文件 |
+| 容量来源 | 真实文件系统 `statfs` |
+| 扩容 | Railway 自动创建 `Photo Storage N` |
+| 告警 | Resend Warning / Critical 邮件 |
+| 默认节点上限 | 10 |
 
-## Request flow
+## 上传请求流程
 
 ```mermaid
 sequenceDiagram
@@ -46,26 +42,31 @@ sequenceDiagram
     participant R as Router
     participant N1 as Node 1
     participant N2 as Node 2
-
     I->>R: PUT /api/file?path=asset
-    R->>N1: capacity / health
-    R->>N2: capacity / health
-    R->>R: choose best eligible node
-    R->>N2: stream upload
-    alt upload succeeds
+    R->>N1: 查询容量 / 健康状态
+    R->>N2: 查询容量 / 健康状态
+    R->>R: 选择最佳节点
+    par 并行
+      R->>N2: 流式上传
+    and
+      R->>R: 临时 spool
+    end
+    alt 主节点成功
       N2-->>R: success
       R-->>I: success
-    else upload fails
+    else 主节点失败
       N2-->>R: error
-      R->>N1: retry upload
+      R->>N1: 从 spool 重放
       N1-->>R: success
       R-->>I: success
     end
 ```
 
+正常路径只有一次 Router→Photo Storage 数据传输；spool 与主上传并行进行，只在主节点失败时用于重放。客户端主动中止上传时，Router 会销毁正在进行的分支并清理临时目录。
+
 ## `STORAGE_NODES`
 
-Example:
+示例：
 
 ```json
 [
@@ -75,40 +76,38 @@ Example:
 ]
 ```
 
-`REMOTE_STORAGE_TOKEN` protects Router access and is propagated to automatically created Photo Storage services. A node may optionally define its own token in `STORAGE_NODES`.
+`REMOTE_STORAGE_TOKEN` 用于保护 Router API，并传递给自动创建的 Photo Storage 服务。必要时节点也可以在 `STORAGE_NODES` 中配置独立 token。
 
-## Write routing
+## 写入路由
 
-New files are considered only for healthy nodes with enough free space for the request plus the configured safety margin. When `Content-Length` is available, it is used before allocation.
-
-Default allocation safety margin:
+新文件只会分配到健康且有足够剩余空间的节点。Router 会额外保留安全余量：
 
 ```text
 STORAGE_ALLOCATION_SAFETY_BYTES=67108864
 ```
 
-That is 64 MiB reserved to reduce race conditions near a full volume.
+即默认保留 **64 MiB**，降低多个并发写入在接近满盘时发生空间竞争的风险。
 
-## Capacity monitoring
+## 容量监控
 
-The router collects capacity and health from every configured node once per minute. Automatic expansion is deliberately **proactive**: provisioning starts when all healthy volumes reach the expansion trigger (82% by default), leaving headroom for Railway to create, configure, deploy and health-check the next node before the normal 85% warning level is reached.
+Router 每分钟读取全部已配置节点的真实容量和健康状态。自动扩容采用**提前触发**：所有健康 Volume 达到 **82%** 时就开始扩容，为 Railway 创建 service、配置、build、deployment 和 healthcheck 留出空间；正常 Warning 仍为 **85%**，Critical 为 **95%**。
 
 ```mermaid
 flowchart TD
-    A[Check every 60 seconds] --> B[Query every node]
-    B --> C[Record health + used + free + capacity]
-    C --> D{All nodes >= 82% expansion trigger?}
-    D -- No --> E[Continue normal routing]
-    D -- Yes --> F{Node count < limit?}
-    F -- Yes --> G[Automatic provisioning]
-    F -- No --> H[Capacity alert]
-    C --> I{All nodes >= 85%?}
-    I -- Yes --> J[Warning alert]
-    C --> K{All nodes >= 95%?}
-    K -- Yes --> L[Critical alert]
+    A[每 60 秒检查] --> B[查询所有节点]
+    B --> C[记录健康 / used / free / capacity]
+    C --> D{全部健康节点 >= 82%?}
+    D -- 否 --> E[继续正常路由]
+    D -- 是 --> F{节点数 < 上限?}
+    F -- 是 --> G[启动自动扩容]
+    F -- 否 --> H[容量告警]
+    C --> I{全部节点 >= 85%?}
+    I -- 是 --> J[Warning]
+    C --> K{全部节点 >= 95%?}
+    K -- 是 --> L[Critical]
 ```
 
-Production defaults:
+当前生产默认配置：
 
 ```text
 STORAGE_PROVISION_TRIGGER_PERCENT=82
@@ -120,38 +119,45 @@ STORAGE_PROVISION_RETRY_INTERVAL_MS=15000
 STORAGE_ALLOCATION_SAFETY_BYTES=67108864
 ```
 
-If provisioning fails after the expansion trigger has been reached, the controller retries after 15 seconds instead of waiting for the normal polling cycle. Normal polling continues every 60 seconds.
+如果达到扩容线后 provisioning 失败，控制器 **15 秒后重试**，而不是等下一轮正常轮询。正常检查仍每 60 秒执行。
 
-Immich's storage endpoint uses Router aggregate capacity, allowing mobile/web clients to display the logical pool size instead of only Immich's local `/data` filesystem.
+## Railway 自动扩容
 
-## Automatic Railway expansion
-
-When every configured volume is healthy and above the proactive expansion trigger, `bootstrap.mjs` provisions the next `Photo Storage N`. The warning threshold remains 85%; the lower expansion trigger exists only to provide build/deployment headroom.
+`bootstrap.mjs` 负责周期性判断容量并调用 `provisioner.mjs` 创建下一 `Photo Storage N`。
 
 ```mermaid
 flowchart TD
-    A[All healthy nodes >= 82%] --> B[Find Photo Storage N]
-    B --> C{Service exists?}
-    C -- No --> D[Create service with project + environment + repo + branch]
-    C -- Yes --> E[Reuse service]
-    D --> F[Configure repo + /photo-storage]
+    A[全部健康节点 >= 82%] --> B[确定 Photo Storage N]
+    B --> C{service 已存在?}
+    C -- 否 --> D[创建 service]
+    C -- 是 --> E[复用 service]
+    D --> F[配置 repo + /photo-storage]
     E --> F
-    F --> G[Create/verify GitHub deployment trigger branch]
-    G --> H[Verify repo + branch]
-    H --> I[Create or reuse exactly one persistent volume]
-    I --> J[Mount at /photos_extern]
-    J --> K[Deploy]
-    K --> L[Poll deployment]
-    L --> M{SUCCESS?}
-    M -- No --> X[Retry after 15 seconds]
-    M -- Yes --> N[Wait for /health]
-    N --> O[Update STORAGE_NODES]
-    O --> P[Redeploy Storage Router]
+    F --> G[创建/验证 GitHub deployment trigger]
+    G --> H[确认 repo + branch]
+    H --> I{已有 Volume?}
+    I -- 是 --> J[复用唯一 Volume]
+    I -- 否 --> K[创建 Persistent Volume]
+    J --> L[挂载 /photos_extern]
+    K --> L
+    L --> M[部署]
+    M --> N[轮询 deployment]
+    N --> O{SUCCESS?}
+    O -- 否 --> X[15 秒后恢复/重试]
+    O -- 是 --> P[等待 /health]
+    P --> Q[更新 STORAGE_NODES]
+    Q --> R[重新部署 Storage Router]
 ```
 
-The provisioner explicitly supplies the configured GitHub repository and branch. It also verifies the Railway deployment trigger and refuses to deploy or attach another volume until the expected repository/branch are confirmed. This prevents a newly created Photo Storage service from deploying with a missing branch and prevents recovery retries from accidentally attaching a second volume to the same service.
+关键防护：
 
-Defaults are:
+- 新节点显式使用 `bowardzhang/immich` 和生产分支 `3.1.0-remote`。
+- 创建或恢复节点后会验证 GitHub deployment trigger 的 repo/branch。
+- 如果 service 已经有一个 Volume，恢复流程会复用它，不会错误地再创建第二个 Volume。
+- 节点只有在 deployment=`SUCCESS` 且 `/health` 正常后才加入活动池。
+- `checkRunning` 防止定时检查和快速 retry 同时启动两个 provisioning 流程。
+
+默认值：
 
 ```text
 STORAGE_REPO=bowardzhang/immich
@@ -161,19 +167,19 @@ STORAGE_PROVISION_MOUNT_PATH=/photos_extern
 STORAGE_MAX_VOLUMES=10
 ```
 
-Required runtime context:
+运行时需要：
 
 ```text
 RAILWAY_PROJECT_ID
 RAILWAY_ENVIRONMENT_ID
 RAILWAY_SERVICE_ID
 REMOTE_STORAGE_TOKEN
-RAILWAY_PROJECT_TOKEN or RAILWAY_API_TOKEN
+RAILWAY_PROJECT_TOKEN 或 RAILWAY_API_TOKEN
 ```
 
-Preferred authentication is a Railway Project Token in `RAILWAY_PROJECT_TOKEN`. For backward compatibility, `RAILWAY_API_TOKEN` is also accepted; if Bearer authentication is rejected, the code retries it as a Project Token using `Project-Access-Token`.
+推荐使用 Railway Project Token。代码优先读取 `RAILWAY_PROJECT_TOKEN`；为兼容现有部署，也支持 `RAILWAY_API_TOKEN`，必要时会以 `Project-Access-Token` 方式重试。
 
-Optional controls:
+可选控制项：
 
 ```text
 STORAGE_AUTO_PROVISION=false
@@ -185,11 +191,11 @@ STORAGE_PROVISION_DEPLOY_TIMEOUT_MS=300000
 STORAGE_PROVISION_HEALTH_TIMEOUT_MS=120000
 ```
 
-On startup, the provisioner performs an access check and logs `storage-provision-access` with `PASS` or `FAIL` without printing token values.
+Router 启动后会执行 provisioning 权限检查，并记录 `storage-provision-access` 的 `PASS` 或 `FAIL`，不会输出 token 内容。
 
-## Alerts
+## 容量告警
 
-Capacity warnings and critical conditions can be delivered through Resend.
+可通过 Resend 发送 Warning/Critical 邮件：
 
 ```text
 RESEND_API_KEY
@@ -197,64 +203,79 @@ ALERT_EMAIL_TO
 ALERT_EMAIL_FROM
 ```
 
-At the configured maximum node count, the system alerts instead of attempting to create an unsupported extra storage node.
+达到 `STORAGE_MAX_VOLUMES` 后系统只发送告警，不会继续创建超出支持上限的节点。
 
-## Endpoints
+## API
 
-| Method | Endpoint | Purpose |
+| 方法 | Endpoint | 用途 |
 |---|---|---|
-| `GET` | `/health` | Router health |
-| `GET` | `/api/storage` | Aggregate pool capacity |
-| `GET` | `/api/storage/status` | Per-volume health and usage |
-| `GET` / `HEAD` | `/api/file?path=...` | Read or inspect a file |
-| `PUT` | `/api/file?path=...` | Upload a file |
-| `DELETE` | `/api/file?path=...` | Delete a file |
-| `MOVE` | `/api/file?path=...&source=...` | Move/rename a file |
-| `GET` | `/api/list?path=...&recursive=true\|false` | List files |
+| `GET` | `/health` | Router 健康检查 |
+| `GET` | `/api/storage` | 聚合存储池容量 |
+| `GET` | `/api/storage/status` | 各 Volume 健康状态和使用率 |
+| `GET` / `HEAD` | `/api/file?path=...` | 读取/检查文件 |
+| `PUT` | `/api/file?path=...` | 上传文件 |
+| `DELETE` | `/api/file?path=...` | 删除文件 |
+| `MOVE` | `/api/file?path=...&source=...` | 移动/重命名文件 |
+| `GET` | `/api/list?path=...&recursive=true\|false` | 列出文件 |
 
-## Temporary files and self-tests
+## 临时文件和 Self-test
 
-Production self-tests write under `.storage-router-selftest/`, verify the file lifecycle and delete test files during normal and best-effort failure cleanup. Upload staging uses ephemeral `/tmp`, not persistent Photo Storage volumes.
+生产 self-test 在 `.storage-router-selftest/` 下写入测试文件，验证完整生命周期后删除。上传 spool 使用 ephemeral `/tmp`，不会占用 Photo Storage Persistent Volume。
 
-Repository regression tests such as `test-multi-volume.mjs` use in-memory mock volumes. `test-storage.ps1` uses a dedicated temporary prefix and attempts cleanup in `finally`. These test scripts are not copied into the production Router image.
+仓库中的 `test-multi-volume.mjs` 使用内存 mock volume；测试覆盖普通流式上传、无 `Content-Length` 的 chunked body、主节点失败后的 spool failover，以及客户端中止上传后的恢复和清理。
 
-## Media-processing compatibility
+## 媒体处理兼容性
 
-Immich components such as FFmpeg, Sharp and ExifTool sometimes require real filesystem paths. This fork combines HTTP streaming with local ephemeral staging where such tools need a local file.
+FFmpeg、Sharp、ExifTool 等工具有时要求真实本地文件路径。本 Fork 在这些场景使用临时本地 staging：
 
 ```mermaid
 flowchart LR
-    A[Remote original media] --> B[Immich remote-storage adapter]
-    B --> C{Tool needs local path?}
-    C -- No --> D[Stream directly]
-    C -- Yes --> E[Temporary local staging]
+    A[远程原始媒体] --> B[Immich remote-storage adapter]
+    B --> C{工具是否需要本地路径?}
+    C -- 否 --> D[直接流式读取]
+    C -- 是 --> E[临时本地 staging]
     E --> F[FFmpeg / Sharp / ExifTool]
-    F --> G[Cleanup temporary file]
+    F --> G[清理临时文件]
 ```
 
-## Operational rule for `/data`
+## `/data` 运维规则
 
-Do not delete Immich-managed `thumbs`, `encoded-video`, `profile`, `backups` or similar `/data` content merely because original photos and videos are remote. `/data` remains part of the Immich application architecture.
+即使原始照片和视频已经迁移到远程 Photo Storage，也不要手工删除 Immich 管理的 `thumbs`、`encoded-video`、`profile`、`backups` 等 `/data` 内容。`/data` 仍是 Immich 架构的一部分。
 
-## Upgrading Immich
+## Railway Watch Paths
 
-This fork tracks upstream stable versions using versioned `*-remote` branches.
+生产 Router 只监视实际影响运行镜像的核心文件，例如：
+
+```text
+/storage-router/server.mjs
+/storage-router/bootstrap.mjs
+/storage-router/provisioner.mjs
+/storage-router/selftest.mjs
+/storage-router/package.json
+/storage-router/Dockerfile
+```
+
+因此修改 `storage-router/README.md` 或测试文件不会重启生产 Router。这一点对手机持续备份期间的稳定性很重要。
+
+## 升级 Immich
+
+本 Fork 用版本化 `*-remote` 分支跟踪上游 stable release：
 
 ```mermaid
 flowchart LR
-    A[Upstream vX.Y.Z] --> B[X.Y.Z-remote]
-    B --> C[Port fork changes]
-    C --> D[Test]
-    D --> E[Non-production deploy]
-    E --> F[Validate media workflows]
-    F --> G[Switch production]
-    G --> H[Retain old branch for rollback]
+    A[上游 vX.Y.Z] --> B[X.Y.Z-remote]
+    B --> C[移植 Fork 改动]
+    C --> D[测试]
+    D --> E[非生产部署]
+    E --> F[验证媒体工作流]
+    F --> G[生产切换]
+    G --> H[保留旧分支回滚]
 ```
 
-Do not blindly deploy upstream `main`. Verify database migrations, upload/read/delete/move, thumbnails, video processing, metadata extraction, aggregate capacity and multi-volume routing before switching production.
+不要直接把生产环境指向上游 `main`。切换生产前至少验证数据库迁移、上传/读取/删除/MOVE、缩略图、视频处理、元数据提取、聚合容量和多卷路由。
 
-## Related documentation
+## 相关中文文档
 
-- [`../README.md`](../README.md) — fork overview and architecture
-- [`../RAILWAY_REMOTE_STORAGE.md`](../RAILWAY_REMOTE_STORAGE.md) — deployment, operational and upgrade notes
-- [Official Immich documentation](https://docs.immich.app/) — upstream application documentation
+- [`../README.md`](../README.md) — Fork 总览和架构
+- [`../RAILWAY_REMOTE_STORAGE.md`](../RAILWAY_REMOTE_STORAGE.md) — Railway 部署、运维和升级
+- [Immich 官方文档](https://docs.immich.app/) — 上游标准 Immich 功能
