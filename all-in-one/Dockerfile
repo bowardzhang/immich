@@ -79,7 +79,6 @@ COPY LICENSE /LICENSE
 COPY all-in-one/entrypoint.sh /usr/local/bin/immich-aio-entrypoint
 COPY all-in-one/supervisord.conf /etc/supervisor/conf.d/immich-aio.conf
 COPY all-in-one/healthcheck.sh /usr/local/bin/immich-aio-healthcheck
-COPY all-in-one/audit-thumbnails.mjs /usr/local/lib/immich-aio/audit-thumbnails.mjs
 RUN chmod +x /usr/local/bin/immich-aio-entrypoint /usr/local/bin/immich-aio-healthcheck
 
 ENV PATH="${PATH}:/usr/src/app/server/bin" \
