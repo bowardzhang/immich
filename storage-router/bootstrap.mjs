@@ -17,7 +17,15 @@ await import('./server.mjs');
 
 const PORT = Number(process.env.PORT || 8080);
 const TOKEN = process.env.REMOTE_STORAGE_TOKEN || '';
-const CHECK_MS = Number(process.env.STORAGE_PROVISION_CHECK_INTERVAL_MS || 5 * 60 * 1000);
+// Check often enough that a busy backup cannot jump far past the capacity threshold
+// between checks. The actual expansion trigger deliberately starts a few points below
+// the user-facing warning threshold so Railway has time to create/build/health-check
+// the next service before the existing volumes reach 85%.
+const CHECK_MS = Number(process.env.STORAGE_PROVISION_CHECK_INTERVAL_MS || 60 * 1000);
+const CONFIGURED_TRIGGER_PERCENT = Number(process.env.STORAGE_PROVISION_TRIGGER_PERCENT || 82);
+const RETRY_MS = Number(process.env.STORAGE_PROVISION_RETRY_INTERVAL_MS || 15 * 1000);
+let checkRunning = false;
+let retryTimer = null;
 
 async function verifyProvisioning() {
   if (!provisioningEnabled()) {
@@ -32,8 +40,18 @@ async function verifyProvisioning() {
   }
 }
 
+function scheduleRetry() {
+  if (retryTimer) return;
+  retryTimer = setTimeout(() => {
+    retryTimer = null;
+    void checkProvisioning();
+  }, RETRY_MS);
+  retryTimer.unref();
+}
+
 async function checkProvisioning() {
-  if (!provisioningEnabled()) return;
+  if (!provisioningEnabled() || checkRunning) return;
+  checkRunning = true;
   try {
     const response = await fetch(`http://127.0.0.1:${PORT}/api/storage/status`, {
       headers: TOKEN ? { authorization: `Bearer ${TOKEN}` } : {},
@@ -41,15 +59,32 @@ async function checkProvisioning() {
     if (!response.ok) throw new Error(`router status ${response.status}`);
     const status = await response.json();
     const volumes = status.volumes || [];
-    const allWarning = volumes.length > 0 && volumes.every((item) => item.healthy && item.usagePercent >= status.warningPercent);
-    if (!allWarning || status.volumeLimitReached) return;
-    console.log(JSON.stringify({ event: 'storage-provision-trigger', volumes: volumes.length, warningPercent: status.warningPercent }));
-    await ensureNextVolume(volumes.map((item) => ({ name: item.name, url: item.url })));
+    const warningPercent = Number(status.warningPercent || 85);
+    const triggerPercent = Math.min(warningPercent, CONFIGURED_TRIGGER_PERCENT);
+    const allTrigger = volumes.length > 0 && volumes.every((item) => item.healthy && item.usagePercent >= triggerPercent);
+    if (!allTrigger || status.volumeLimitReached) return;
+
+    console.log(JSON.stringify({
+      event: 'storage-provision-trigger',
+      volumes: volumes.length,
+      triggerPercent,
+      warningPercent,
+      usages: volumes.map((item) => ({ name: item.name, usagePercent: item.usagePercent })),
+    }));
+
+    const result = await ensureNextVolume(volumes.map((item) => ({ name: item.name, url: item.url })));
+    console.log(JSON.stringify({ event: 'storage-provision-result', triggerPercent, result }));
+    if (result?.status === 'busy') scheduleRetry();
   } catch (error) {
     console.error(`Automatic storage provisioning check failed: ${error instanceof Error ? error.message : String(error)}`);
+    // If capacity is already near the trigger, a transient Railway/API/source error
+    // should be retried quickly instead of waiting for the next normal polling cycle.
+    scheduleRetry();
+  } finally {
+    checkRunning = false;
   }
 }
 
 setTimeout(() => void verifyProvisioning(), 5_000).unref();
-setTimeout(() => void checkProvisioning(), 15_000).unref();
+setTimeout(() => void checkProvisioning(), 10_000).unref();
 setInterval(() => void checkProvisioning(), CHECK_MS).unref();
