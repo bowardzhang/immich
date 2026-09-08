@@ -114,10 +114,19 @@ async function listDeployments(serviceId) {
 
 async function getServiceSource(serviceId) {
   const data = await gql(
-    `query serviceInstance($serviceId: String!, $environmentId: String!) { serviceInstance(serviceId: $serviceId, environmentId: $environmentId) { source { repo branch image } } }`,
-    { serviceId, environmentId: ENVIRONMENT_ID },
+    `query serviceSource($projectId: String!, $serviceId: String!, $environmentId: String!) {
+      serviceInstance(serviceId: $serviceId, environmentId: $environmentId) { source { repo image } }
+      deploymentTriggers(projectId: $projectId, serviceId: $serviceId, environmentId: $environmentId, first: 20) {
+        edges { node { repository branch } }
+      }
+    }`,
+    { projectId: PROJECT_ID, serviceId, environmentId: ENVIRONMENT_ID },
   );
-  return data.serviceInstance?.source || {};
+
+  const source = data.serviceInstance?.source || {};
+  const triggers = data.deploymentTriggers?.edges?.map((edge) => edge.node) || [];
+  const trigger = triggers.find((item) => item.branch === BRANCH) || triggers[0] || {};
+  return { repo: source.repo, branch: trigger.branch, triggerRepository: trigger.repository };
 }
 
 async function waitForExpectedSource(serviceId, index) {
@@ -126,14 +135,15 @@ async function waitForExpectedSource(serviceId, index) {
 
   while (Date.now() < deadline) {
     lastSource = await getServiceSource(serviceId);
-    if (lastSource.repo === REPO && lastSource.branch === BRANCH) {
+    const triggerRepoMatches = !lastSource.triggerRepository || lastSource.triggerRepository === REPO;
+    if (lastSource.repo === REPO && lastSource.branch === BRANCH && triggerRepoMatches) {
       return lastSource;
     }
     await sleep(2000);
   }
 
   throw new Error(
-    `Photo Storage ${index} source is not ready: expected repo=${REPO} branch=${BRANCH}, got repo=${lastSource.repo || 'missing'} branch=${lastSource.branch || 'missing'}. Refusing to create/attach a volume or deploy an incomplete service.`,
+    `Photo Storage ${index} source is not ready: expected repo=${REPO} branch=${BRANCH}, got repo=${lastSource.repo || 'missing'} branch=${lastSource.branch || 'missing'} triggerRepo=${lastSource.triggerRepository || 'missing'}. Refusing to create/attach a volume or deploy an incomplete service.`,
   );
 }
 
