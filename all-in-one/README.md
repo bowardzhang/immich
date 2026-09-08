@@ -1,20 +1,70 @@
-# Immich All-in-One for Railway
+# Immich Railway All-in-One 中文文档
 
-This image is designed for the `Family-Photos` Railway project to consolidate Immich Server, PostgreSQL and Redis-compatible storage into a single service and a single persistent volume.
+<p align="center"><strong>简体中文</strong> · <a href="README.en.md">English</a></p>
 
-## Safety / rollout
+本目录定义 `Family-Photos` 当前生产使用的 Immich All-in-One 镜像。它把 Immich Server、PostgreSQL 14 和 Redis 合并到一个 Railway 服务和一个 `/data` Persistent Volume 中。
 
-The image has now passed an ephemeral validation deployment with local PostgreSQL, Redis, VectorChord/pgvector, the custom Immich server, and a read-only logical restore from the production database. The production cutover reuses the existing Immich `/data` Railway volume and stores local AIO state under `/data/.aio` while keeping Immich media at `/data`.
+## 当前生产结构
 
-Machine Learning remains intentionally disabled during the first production cutover (`IMMICH_AIO_ENABLE_ML=false`) because facial recognition and Smart Search are rarely used. It will be added as an optional local process after the core server/database/Redis combination is stable.
+```mermaid
+flowchart TB
+    A[Immich AIO Container]
+    A --> I[Immich Server / Microservices]
+    A --> P[PostgreSQL 14]
+    A --> R[Redis]
+    A --> D[(Railway /data Volume)]
+    D --> PD[/data/.aio/postgres/data]
+    D --> RD[/data/.aio/redis]
+    D --> M[thumbs / previews / encoded-video / profiles]
+    I --> SR[Storage Router]
+```
 
-## Shared volume layout
+原始照片/视频主要通过 Storage Router 保存到 Photo Storage 1–9；`/data` 仍保存数据库、Redis 和 Immich 派生数据。
 
-Production Immich service:
+## 运行规则
 
-- `/data` — existing Immich media/system folders
-- `/data/.aio/postgres/data` — PostgreSQL cluster
-- `/data/.aio/redis` — Redis persistence
-- `/data/.aio/ml-cache` — optional ML cache
+- Immich AIO **保持常驻**，不要启用 Railway Serverless。
+- PostgreSQL 数据目录：`/data/.aio/postgres/data`
+- Redis 数据目录：`/data/.aio/redis`
+- Machine Learning 默认关闭：`IMMICH_AIO_ENABLE_ML=false`
+- 健康检查：`/api/server/ping`
+- 不再依赖独立 PostgreSQL 或 Redis 服务。
 
-Validation service defaults to the equivalent layout below `/persistent`.
+## 远程媒体兼容
+
+本 Fork 包含远程原图 staging 支持：当数据库路径仍指向 `/data/...`、但原图已经迁移到 Storage Router 时，Sharp/FFmpeg/ExifTool 等媒体处理任务可以临时从远程存储取回文件，处理完成后删除临时文件。
+
+这使缩略图和 preview 可以正常生成，而不需要把整个媒体库重新复制回 `/data`。
+
+## Web 缓存兼容
+
+`patch-web-thumbnail-cache.mjs` 在本 `3.1.0-remote` 分支构建 Web 时加入固定缓存版本，用于避免历史缩略图失败响应继续被浏览器缓存。它是构建期兼容补丁，不会在运行时执行后台维修任务。
+
+## 数据库迁移代码
+
+`entrypoint.sh` 仍保留从外部 PostgreSQL 做只读 `pg_dump | psql` 迁移的能力，用于未来重新部署/灾难恢复场景。但当前生产已经完成迁移，外部 PostgreSQL 服务已删除，正常启动直接使用 `/data/.aio/postgres/data`。
+
+## 已清理的一次性代码
+
+缩略图故障排查完成后已经删除：
+
+- `audit-thumbnails.mjs`
+- Supervisor `thumbnail-audit` program
+- Dockerfile 中的 audit 脚本 copy step
+
+Supervisor 现在只管理：
+
+```text
+postgres
+redis
+immich
+```
+
+## `/data` 安全规则
+
+不要删除或重新初始化生产 `/data` Volume。它现在包含生产 PostgreSQL 数据库以及 Immich 管理的缩略图、preview、转码文件和用户数据。
+
+## 相关文档
+
+- [`../RAILWAY_REMOTE_STORAGE.md`](../RAILWAY_REMOTE_STORAGE.md)
+- [`../storage-router/README.md`](../storage-router/README.md)
