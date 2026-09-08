@@ -24,6 +24,16 @@ log "preparing shared persistent tree at $PERSISTENT_ROOT"
 mkdir -p "$PGDATA" "$REDIS_DATA_DIR" "$IMMICH_MEDIA_LOCATION" "$ML_CACHE"
 chown -R postgres:postgres "$(dirname "$PGDATA")"
 
+# A restored database may already record successful mount checks. Ensure the corresponding
+# marker files exist before Immich starts. Existing files are preserved and only missing
+# markers are created, so this is safe for an existing /data volume.
+for folder in upload thumbs backups library profile encoded-video; do
+  mkdir -p "$IMMICH_MEDIA_LOCATION/$folder"
+  if [ ! -e "$IMMICH_MEDIA_LOCATION/$folder/.immich" ]; then
+    printf '%s' "$(date +%s%3N)" > "$IMMICH_MEDIA_LOCATION/$folder/.immich"
+  fi
+done
+
 new_cluster=false
 if [ ! -s "$PGDATA/PG_VERSION" ]; then
   new_cluster=true
@@ -56,7 +66,6 @@ full_page_writes = on
 PGCONF
 fi
 
-# A newly initialized cluster must be started once before optional migration/database creation.
 if [ "$new_cluster" = true ]; then
   runuser -u postgres -- /usr/lib/postgresql/14/bin/pg_ctl -D "$PGDATA" -w start
 
@@ -75,7 +84,6 @@ if [ "$new_cluster" = true ]; then
     log "starting read-only logical migration from ${IMMICH_AIO_SOURCE_DB_HOST}:${src_port}/${src_db}"
     log "source database is never modified; pg_dump is piped directly into the local PostgreSQL cluster"
 
-    # Drop/recreate the empty target database to guarantee a clean restore target.
     runuser -u postgres -- /usr/lib/postgresql/14/bin/dropdb --if-exists --username "$DB_USERNAME" "$DB_DATABASE_NAME"
     runuser -u postgres -- /usr/lib/postgresql/14/bin/createdb --username "$DB_USERNAME" "$DB_DATABASE_NAME"
 
@@ -96,7 +104,6 @@ if [ "$new_cluster" = true ]; then
       exit 1
     fi
 
-    # Compare counts for key Immich tables when present. This remains schema-version tolerant.
     for table in asset album "user"; do
       exists="$(runuser -u postgres -- /usr/lib/postgresql/14/bin/psql -U "$DB_USERNAME" -d "$DB_DATABASE_NAME" -Atc "SELECT to_regclass('public.\"$table\"') IS NOT NULL;")"
       if [ "$exists" = "t" ]; then
