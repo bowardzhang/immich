@@ -1,5 +1,6 @@
 import { ensureNextVolume, provisioningEnabled, verifyProvisioningAccess } from './provisioner.mjs';
 
+// Provisioning mode is intentionally separate from the normal serverless entrypoint.
 const nativeFetch = globalThis.fetch;
 globalThis.fetch = async (...args) => {
   const response = await nativeFetch(...args);
