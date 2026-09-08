@@ -2,11 +2,21 @@
 
 <p align="center"><strong>简体中文</strong> · <a href="RAILWAY_REMOTE_STORAGE.en.md">English</a></p>
 
-本文档说明本仓库相对于上游 Immich 增加的 Railway 多卷存储架构。标准 Immich 功能和用户操作请参考 [Immich 官方文档](https://docs.immich.app/)。
+本文档描述本仓库在 Railway 上的当前生产架构。标准 Immich 功能请参考 [Immich 官方文档](https://docs.immich.app/)。
 
-## 设计目标
+## 当前基线
 
-Railway Persistent Volume 只能挂载到单个 service。本 Fork 将多个“一服务一卷”的 Photo Storage 服务组合成一个逻辑媒体存储池，使 Immich 无需知道照片实际位于哪个物理 Volume。
+截至 2026-09-08：
+
+- 上游基线：Immich v3.1.0
+- 生产分支：`3.1.0-remote`
+- 生产项目：`Family-Photos`
+- Immich：All-in-One，内置 PostgreSQL 14 + Redis
+- Storage Router：Serverless
+- Photo Storage：固定 **1–9** 共 9 个节点，全部 Serverless
+- 自动创建 Photo Storage：**已停用并从仓库移除**
+
+## 生产拓扑
 
 ```mermaid
 flowchart TB
@@ -14,232 +24,177 @@ flowchart TB
       W[Immich Web]
       M[Immich Mobile]
     end
-    W --> I[Immich Server]
+
+    W --> I[Immich AIO]
     M --> I
-    I --> D[(本地 /data)]
-    I --> R[Storage Router]
-    subgraph RemoteMedia[远程原始媒体存储池]
-      R --> S1[Photo Storage 1]
-      R --> S2[Photo Storage 2]
-      R --> S3[Photo Storage 3]
-      R -.-> SN[Photo Storage N]
-      S1 --> V1[(Volume 1)]
-      S2 --> V2[(Volume 2)]
-      S3 --> V3[(Volume 3)]
-      SN --> VN[(Volume N)]
-    end
-    D --> O[缩略图 / 预览 / 转码视频 / 用户资料 / 备份]
+
+    I --> D[(Immich /data Volume)]
+    I --> R[Storage Router - Serverless]
+
+    D --> DB[(PostgreSQL /data/.aio/postgres/data)]
+    D --> RD[(Redis /data/.aio/redis)]
+    D --> DER[缩略图 / preview / encoded-video / profiles]
+
+    R --> S1[Photo Storage 1]
+    R --> S2[Photo Storage 2]
+    R --> SX[...]
+    R --> S9[Photo Storage 9]
+
+    S1 --> V1[(5 GB Volume)]
+    S2 --> V2[(5 GB Volume)]
+    S9 --> V9[(5 GB Volume)]
 ```
 
-原始照片和视频通过 Storage Router 保存。Immich `/data` Volume 仍然用于应用管理的数据和派生文件，因此不能因为原始媒体迁移到了远程存储就删除 `/data`。
+原始照片和视频通过 Storage Router 分布到 Photo Storage Volume；Immich `/data` 负责本地数据库、Redis 和派生媒体，因此 `/data` 仍是关键生产 Volume。
 
-## 本 Fork 的核心行为
+## 为什么 Immich AIO 不使用 Serverless
 
-### 多卷路由
+Immich AIO 内同时运行：
 
-Storage Router 向 Immich 暴露一个 HTTP API，背后管理多个 Photo Storage 节点。新文件优先分配到剩余空间最多的健康节点；已有文件按逻辑路径在节点中定位，因此不需要额外的路由数据库。
+- Immich Server / Microservices
+- PostgreSQL 14
+- Redis
 
-### 聚合容量显示
+如果整个 AIO 睡眠，数据库和后台任务也会一起暂停，会带来冷启动和任务中断风险。因此当前设计是：
 
-启用 `REMOTE_STORAGE_URL` 后，Immich storage API 返回远程存储池的总容量，而不是小型本地 `/data` 文件系统容量，使 Web/移动客户端显示的容量与实际媒体池一致。
-
-### 自动扩容
-
-自动扩容采用提前触发策略：所有健康节点达到 **82%** 时就开始创建下一 `Photo Storage N`，而不是等到 85% warning 后才开始。85% 和 95% 分别保留为 Warning/Critical 告警阈值。
-
-```mermaid
-sequenceDiagram
-    participant Monitor as 容量监控
-    participant Railway as Railway API
-    participant Node as Photo Storage N
-    participant Router as Storage Router
-    Monitor->>Monitor: 所有健康节点 >= 82%
-    Monitor->>Railway: 创建/恢复 service 并验证 repo + branch
-    Railway->>Railway: 创建或复用唯一 Persistent Volume
-    Monitor->>Railway: 部署
-    Monitor->>Railway: 轮询 deployment
-    Railway-->>Monitor: SUCCESS
-    Monitor->>Node: GET /health
-    Node-->>Monitor: 200 OK
-    Monitor->>Router: 更新 STORAGE_NODES
-    Monitor->>Railway: 重新部署 Router
-```
-
-扩容控制器每 **60 秒**检查一次；如果达到扩容阈值后操作失败，会在 **15 秒**后快速重试。创建请求显式指定 GitHub 仓库和 `3.1.0-remote` 分支，并验证 Railway deployment trigger，防止新节点因为分支缺失而无法部署。
-
-### 监控与告警
-
-每个 Photo Storage 节点报告真实文件系统容量。Router 记录节点健康状态、已用空间、剩余空间和使用率，并可通过 Resend 发送容量告警。
-
-| 设置 | 当前默认值 |
-|---|---:|
-| 提前扩容 | 82% |
-| Warning | 85% |
-| Critical | 95% |
-| 容量检查间隔 | 60 秒 |
-| 扩容检查间隔 | 60 秒 |
-| 扩容失败重试 | 15 秒 |
-| 最大存储节点 | 10 |
-| 分配安全余量 | 64 MiB |
-
-## 数据流
-
-### 上传
-
-```mermaid
-flowchart LR
-    A[Immich 写入逻辑路径] --> B[Storage Router]
-    B --> C{健康且空间足够的节点}
-    C --> D[选择剩余空间最多的节点]
-    D --> E[流式上传 + 临时 spool]
-    E --> F{主节点成功?}
-    F -- 是 --> G[返回成功并清理 spool]
-    F -- 否 --> H[用 spool 重放到其他可用节点]
-```
-
-Router 一边把请求流向选定 Photo Storage，一边把同一数据临时 spool 到 ephemeral `/tmp`。正常成功路径不需要再进行第二次完整复制；主节点失败时才使用 spool 进行 failover。客户端中止上传时会清理未完成的临时文件。
-
-### 已有文件访问
-
-```mermaid
-flowchart LR
-    A[GET / HEAD / DELETE / MOVE] --> B[查询已配置节点]
-    B --> C{找到逻辑路径?}
-    C -- 是 --> D[在实际拥有文件的节点执行操作]
-    C -- 否 --> E[返回 not found]
-```
-
-### 跨 Volume MOVE
-
-同一节点内尽量使用本地 MOVE。必须跨 Volume 时，Router 先复制到目标节点，只有目标写入成功后才删除源文件，从而避免 MOVE 失败造成源数据丢失。
-
-## 服务职责
-
-| 组件 | 职责 |
+| 服务 | Serverless |
 |---|---|
-| Immich Server | 标准 Immich API、远程媒体集成、聚合容量显示 |
-| Storage Router | 路由、故障转移、容量聚合、监控、告警、扩容触发 |
-| Photo Storage N | 一个 Persistent Volume 对应的最小 HTTP 文件服务 |
-| Railway Provisioner | 创建/恢复/部署下一存储节点并更新 Router 成员 |
-| `/data` Volume | Immich 自己管理的运行数据和派生媒体 |
+| Immich AIO | 否，常驻 |
+| Storage Router | 是 |
+| Photo Storage 1–9 | 是 |
 
-## 关键配置
+## Storage Router
 
-### Immich
+Router 向 Immich 暴露一个逻辑 HTTP 存储池：
+
+- 新文件选择剩余空间最多的健康节点；
+- 已有文件按逻辑路径定位；
+- 上传期间使用 ephemeral spool 支持 failover；
+- 聚合所有节点容量供 Immich UI 显示；
+- 不维护单独的路由数据库。
+
+当前生产节点由 `STORAGE_NODES` 静态配置，不再由程序自动修改。
+
+## 容量显示
+
+Immich 的 storage API 会优先读取 Router 的聚合容量，因此 Web 页面显示约整个远程媒体池容量，而不是只显示本地 `/data` 的约 5 GB。
+
+远程容量查询具有更长超时和最近成功值缓存，以适应 Serverless 节点冷启动。
+
+## 缩略图和远端原图处理
+
+历史迁移后，一部分数据库路径仍指向 `/data/...`，但实际原图已经位于远程 Photo Storage。当前 Fork 包含两层兼容逻辑：
+
+1. Web/文件读取发现本地 `/data/...` 不存在时，可回退到 Storage Router 同逻辑路径；
+2. Sharp/FFmpeg/ExifTool 等需要本地路径时，会把远端原图临时 staging 到 ephemeral 本地文件，处理完成后清理。
+
+因此生成缩略图不需要把整个原图库重新复制回 Immich Volume。
+
+## 固定 Photo Storage 节点池
+
+当前生产使用 Photo Storage 1–9。每个节点：
+
+- source：`bowardzhang/immich`
+- branch：`3.1.0-remote`
+- root directory：`/photo-storage`
+- volume mount：`/photos_extern`
+- healthcheck：`/health`
+- Serverless：开启
+
+`REMOTE_STORAGE_TOKEN` 在 Router 和节点间共享。
+
+## 手工增加容量
+
+自动扩容已退役。以后如果确实需要新增节点：
+
+1. 手工创建 `Photo Storage N`；
+2. 按现有节点配置 source/root/volume/token；
+3. 等待 deployment=`SUCCESS`；
+4. 验证 `/health`；
+5. 把节点加入 Router 的 `STORAGE_NODES`；
+6. 重新部署 Router；
+7. 验证 `/api/storage`、上传、读取、删除和 MOVE。
+
+这种方式牺牲自动化，但更适合当前低频扩容场景，也避免 Railway API 权限、半创建 service、误挂 Volume 等复杂状态。
+
+## 已退役的自动扩容组件
+
+以下代码已删除：
 
 ```text
-IMMICH_MEDIA_LOCATION=/remote/photo-extern
-REMOTE_STORAGE_URL=http://storage-router.railway.internal:8080
-REMOTE_STORAGE_TOKEN=<共享密钥>
+storage-router/bootstrap.mjs
+storage-router/provisioner.mjs
+storage-router/maintenance-bootstrap.mjs
 ```
 
-### Storage Router
+旧 Railway 环境里仍可能看到名称为 `STORAGE_PROVISION_*`、`STORAGE_AUTO_PROVISION`、`RAILWAY_API_TOKEN` 等历史变量；这些变量已被禁用/清空，当前生产运行路径不再依赖它们。
 
-`STORAGE_NODES` 是 Photo Storage 节点的 JSON 数组，例如：
+## 一次性维修代码清理
 
-```json
-[
-  {"name":"photo-storage-1","url":"http://photo-storage-1.railway.internal:8080"},
-  {"name":"photo-storage-2","url":"http://photo-storage-2.railway.internal:8080"},
-  {"name":"photo-storage-3","url":"http://photo-storage-3.railway.internal:8080"}
-]
-```
-
-重要变量：
+缩略图修复完成后，以下临时代码也已移除：
 
 ```text
-STORAGE_NODES
-REMOTE_STORAGE_TOKEN
-STORAGE_PROVISION_TRIGGER_PERCENT
-STORAGE_WARNING_PERCENT
-STORAGE_CRITICAL_PERCENT
-STORAGE_AUTO_PROVISION
-STORAGE_MAX_VOLUMES
-STORAGE_CHECK_INTERVAL_MS
-STORAGE_PROVISION_CHECK_INTERVAL_MS
-STORAGE_PROVISION_RETRY_INTERVAL_MS
-RAILWAY_PROJECT_TOKEN 或 RAILWAY_API_TOKEN
-RESEND_API_KEY
-ALERT_EMAIL_TO
-ALERT_EMAIL_FROM
+all-in-one/audit-thumbnails.mjs
+Supervisor thumbnail-audit program
+Docker image thumbnail-audit copy step
 ```
 
-完整说明见 [`storage-router/README.md`](storage-router/README.md)。
+保留的 `patch-remote-media-input.mjs` 属于生产功能；`patch-web-thumbnail-cache.mjs` 用于本分支的缩略图缓存兼容，仍参与 Web build，不属于后台维修任务。
 
-## 自动扩容恢复策略
+## 生产 Watch Paths
 
-Provisioner 不仅处理“全新创建”，也处理上一次扩容中断后留下的部分资源：
+Storage Router 只监视：
 
-1. 计算下一节点名称 `Photo Storage N`。
-2. 如果 service 已存在则复用，不重复创建。
-3. 显式验证 GitHub repo 和 branch deployment trigger。
-4. 如果已有一个 Persistent Volume，则复用该 Volume；不会错误地再挂第二个 Volume。
-5. 配置 `/photo-storage`、环境变量和 `/photos_extern` 挂载点。
-6. 发起 deployment 并轮询到终态。
-7. 只有 deployment 为 `SUCCESS` 且 `/health` 成功后，才把节点加入 `STORAGE_NODES`。
-8. 更新 Router 配置并重新部署 Router。
-9. 如果中途发生可恢复错误，在达到容量触发条件时 15 秒后重试。
-
-这种设计避免“service 已经创建，但 branch/volume/deployment 只完成一半”后永久卡住。
-
-## 临时文件与持久化策略
-
-- Router upload spool 使用 ephemeral `/tmp`，完成或失败后清理。
-- 生产 self-test 使用 `.storage-router-selftest/`，验证后删除测试文件。
-- 仓库回归测试使用内存 mock volume。
-- 集成测试使用独立临时前缀，并在 `finally` 中尽力清理。
-
-不要为了释放空间手工删除 Immich 管理的 `thumbs`、`encoded-video`、`profile`、`backups` 等 `/data` 目录。这些属于应用数据，应通过 Immich 支持的方式维护。
-
-## 故障处理
-
-```mermaid
-flowchart TD
-    A[存储操作] --> B{节点健康?}
-    B -- 否 --> C[新文件分配排除该节点]
-    B -- 是 --> D[执行操作]
-    D --> E{成功?}
-    E -- 是 --> F[完成]
-    E -- 否 --> G{存在可用替代节点?}
-    G -- 是 --> H[重试 / failover]
-    G -- 否 --> I[返回错误并记录状态]
+```text
+/storage-router/server.mjs
+/storage-router/serverless-bootstrap.mjs
+/storage-router/package.json
+/storage-router/Dockerfile
 ```
 
-新创建的节点在 deployment 达到 `SUCCESS` 且 `/health` 返回成功之前，不会加入活动 Router 节点列表。
+因此 README 和测试脚本修改不会触发 Router 重部署。
 
-## Railway Watch Paths
+Photo Storage 只监视 `/photo-storage/**`。Immich AIO 监视 `all-in-one`、server/web/packages 等真正影响镜像的目录。
 
-为避免文档、测试或移动端改动导致正在备份照片时无意义地重启生产服务，生产服务使用 Watch Paths。例如 Storage Router 只监视真正进入生产镜像的核心文件；测试和 README 改动不会触发 Router 重部署。
+## 数据安全规则
 
-因此更新中文文档不会中断当前照片备份。
+- 不要删除 Immich `/data` Volume；其中现在包含生产 PostgreSQL。
+- 不要手工清理 `/data/thumbs`、`encoded-video`、`profile` 等 Immich 管理目录。
+- Photo Storage Volume 只通过 Router/Photo Storage API 操作，避免数据库与文件状态不一致。
+- 远程媒体池和 `/data` 是互补关系，不是二选一。
 
-## 升级模型
+## Railway 服务清单
 
-本 Fork 使用版本化 `*-remote` 分支跟踪上游 stable release：
+当前生产只应存在：
 
-```mermaid
-flowchart TD
-    A[上游 stable vX.Y.Z] --> B[创建 X.Y.Z-remote]
-    B --> C[移植 remote-storage 改动]
-    C --> D[解决上游冲突]
-    D --> E[编译 + 自动测试]
-    E --> F[非生产环境部署]
-    F --> G[验证数据库迁移]
-    G --> H[验证上传/读取/删除/MOVE]
-    H --> I[验证缩略图/转码/元数据]
-    I --> J[验证全部存储节点]
-    J --> K[生产切换分支]
-    K --> L[保留旧分支用于回滚]
+```text
+Immich
+Storage Router
+Photo Storage 1
+Photo Storage 2
+...
+Photo Storage 9
 ```
 
-不要让生产环境直接跟踪上游 `main`。生产 branch switch 应是完成兼容性验证后的最后一步。
+不再需要独立的 PostgreSQL、Redis、Machine Learning、测试 AIO 或临时迁移服务。
 
-## 当前基线
+## 升级 Immich
 
-截至 2026-09-08，本 Fork 基于上游 **Immich v3.1.0**，生产分支为 **`3.1.0-remote`**。
+继续使用版本化 `*-remote` 分支跟踪上游 stable：
+
+1. 基于新的上游 stable 创建新 remote 分支；
+2. 移植 Storage Router/AIO/远程媒体改动；
+3. 编译和测试；
+4. 在非生产环境验证数据库迁移；
+5. 验证上传、读取、删除、MOVE；
+6. 验证缩略图、视频、元数据和远端 staging；
+7. 验证 9 节点容量和 Serverless 冷启动；
+8. 最后切换 production branch。
+
+不要让生产直接跟踪上游 `main`。
 
 ## 相关文档
 
-- [`README.md`](README.md) — 项目总体架构和快速说明
-- [`storage-router/README.md`](storage-router/README.md) — Storage Router 配置、API、监控和自动扩容详细说明
-- [Immich 官方文档](https://docs.immich.app/) — 上游标准功能文档
+- [`storage-router/README.md`](storage-router/README.md) — Router API、固定节点池和手工扩容
+- [`all-in-one/README.md`](all-in-one/README.md) — Immich AIO 当前结构
+- [Immich 官方文档](https://docs.immich.app/)
