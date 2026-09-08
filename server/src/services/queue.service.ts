@@ -84,6 +84,12 @@ export class QueueService extends BaseService {
         this.logger.log('One-shot thumbnail repair requested; queueing forced regeneration for all assets');
         await this.jobRepository.queue({ name: JobName.AssetGenerateThumbnailsQueueAll, data: { force: true } });
       }
+
+      const repairAssetId = process.env.IMMICH_AIO_REPAIR_THUMBNAIL_ASSET_ID?.trim();
+      if (repairAssetId) {
+        this.logger.log(`One-shot thumbnail repair requested for asset ${repairAssetId}`);
+        await this.jobRepository.queue({ name: JobName.AssetGenerateThumbnails, data: { id: repairAssetId } });
+      }
     } else if (this.worker === ImmichWorker.Api) {
       this.jobRepository.watchWorkers();
     }
