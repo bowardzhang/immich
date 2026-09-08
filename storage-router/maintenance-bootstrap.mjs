@@ -25,13 +25,13 @@ async function gql(query, variables = {}) {
   return body.data;
 }
 
-for (const id of CLEANUP_IDS) {
+for (const volumeId of CLEANUP_IDS) {
   const data = await gql(
-    `mutation volumeDelete($id: String!) { volumeDelete(id: $id) }`,
-    { id },
+    `mutation volumeDelete($volumeId: String!) { volumeDelete(volumeId: $volumeId) }`,
+    { volumeId },
   );
-  if (data.volumeDelete !== true) throw new Error(`volumeDelete(${id}) returned ${String(data.volumeDelete)}`);
-  console.log(JSON.stringify({ event: 'storage-maintenance', action: 'volume-deleted', volumeId: id }));
+  if (data.volumeDelete !== true) throw new Error(`volumeDelete(${volumeId}) returned ${String(data.volumeDelete)}`);
+  console.log(JSON.stringify({ event: 'storage-maintenance', action: 'volume-deleted', volumeId }));
 }
 
 if (CLEANUP_IDS.length > 0) {
