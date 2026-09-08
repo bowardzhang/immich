@@ -14,6 +14,7 @@ const AUTO_PROVISION = process.env.STORAGE_AUTO_PROVISION !== 'false';
 const PROVISION_COOLDOWN_MS = Number(process.env.STORAGE_PROVISION_COOLDOWN_MS || 60 * 60 * 1000);
 const DEPLOY_TIMEOUT_MS = Number(process.env.STORAGE_PROVISION_DEPLOY_TIMEOUT_MS || 5 * 60 * 1000);
 const HEALTH_TIMEOUT_MS = Number(process.env.STORAGE_PROVISION_HEALTH_TIMEOUT_MS || 2 * 60 * 1000);
+const SOURCE_VERIFY_TIMEOUT_MS = Number(process.env.STORAGE_PROVISION_SOURCE_VERIFY_TIMEOUT_MS || 30 * 1000);
 const RETRY_COUNT = Number(process.env.RAILWAY_API_RETRY_COUNT || 4);
 let lastProvisionAt = 0;
 let running = false;
@@ -109,6 +110,31 @@ async function listDeployments(serviceId) {
     { input: { projectId: PROJECT_ID, serviceId } },
   );
   return data.deployments?.edges?.map((edge) => edge.node) || [];
+}
+
+async function getServiceSource(serviceId) {
+  const data = await gql(
+    `query serviceInstance($serviceId: String!, $environmentId: String!) { serviceInstance(serviceId: $serviceId, environmentId: $environmentId) { source { repo branch image } } }`,
+    { serviceId, environmentId: ENVIRONMENT_ID },
+  );
+  return data.serviceInstance?.source || {};
+}
+
+async function waitForExpectedSource(serviceId, index) {
+  const deadline = Date.now() + SOURCE_VERIFY_TIMEOUT_MS;
+  let lastSource = {};
+
+  while (Date.now() < deadline) {
+    lastSource = await getServiceSource(serviceId);
+    if (lastSource.repo === REPO && lastSource.branch === BRANCH) {
+      return lastSource;
+    }
+    await sleep(2000);
+  }
+
+  throw new Error(
+    `Photo Storage ${index} source is not ready: expected repo=${REPO} branch=${BRANCH}, got repo=${lastSource.repo || 'missing'} branch=${lastSource.branch || 'missing'}. Refusing to create/attach a volume or deploy an incomplete service.`,
+  );
 }
 
 async function createStorageService(index) {
@@ -283,6 +309,18 @@ export async function ensureNextVolume(currentNodes, force = false) {
     }
 
     await configureService(service.id);
+    const source = await waitForExpectedSource(service.id, index);
+    console.log(
+      JSON.stringify({
+        event: 'storage-provision',
+        action: 'source-verified',
+        index,
+        serviceId: service.id,
+        repo: source.repo,
+        branch: source.branch,
+      }),
+    );
+
     const volume = await createOrReuseVolume(service.id, index);
     console.log(JSON.stringify({ event: 'storage-provision', action: 'volume-ready', index, serviceId: service.id, volumeId: volume.id }));
 
