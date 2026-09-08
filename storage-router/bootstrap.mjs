@@ -18,10 +18,6 @@ await import('./server.mjs');
 
 const PORT = Number(process.env.PORT || 8080);
 const TOKEN = process.env.REMOTE_STORAGE_TOKEN || '';
-// Check often enough that a busy backup cannot jump far past the capacity threshold
-// between checks. The actual expansion trigger deliberately starts a few points below
-// the user-facing warning threshold so Railway has time to create/build/health-check
-// the next service before the existing volumes reach 85%.
 const CHECK_MS = Number(process.env.STORAGE_PROVISION_CHECK_INTERVAL_MS || 60 * 1000);
 const CONFIGURED_TRIGGER_PERCENT = Number(process.env.STORAGE_PROVISION_TRIGGER_PERCENT || 82);
 const RETRY_MS = Number(process.env.STORAGE_PROVISION_RETRY_INTERVAL_MS || 15 * 1000);
@@ -83,8 +79,6 @@ async function checkProvisioning() {
     if (result?.status === 'busy') scheduleRetry();
   } catch (error) {
     console.error(`Automatic storage provisioning check failed: ${error instanceof Error ? error.message : String(error)}`);
-    // If capacity is already near the trigger, a transient Railway/API/source error
-    // should be retried quickly instead of waiting for the next normal polling cycle.
     scheduleRetry();
   } finally {
     checkRunning = false;
@@ -94,3 +88,5 @@ async function checkProvisioning() {
 setTimeout(() => void verifyProvisioning(), 5_000).unref();
 setTimeout(() => void checkProvisioning(), 10_000).unref();
 setInterval(() => void checkProvisioning(), CHECK_MS).unref();
+
+// 2026-09-08: one-shot source change to provision Photo Storage 9 after the final volume slot was released.
