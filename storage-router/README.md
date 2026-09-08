@@ -1,5 +1,7 @@
 # Immich Storage Router 中文文档
 
+<p align="center"><strong>简体中文</strong> · <a href="README.en.md">English</a></p>
+
 Storage Router 是本 Fork 最核心的定制服务：它把多个各自挂载一个 Railway Persistent Volume 的 `Photo Storage N` 服务组合成一个逻辑 HTTP 媒体存储池，供 Immich Server 使用。
 
 ## 架构
