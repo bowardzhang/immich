@@ -154,6 +154,6 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-server.listen(PORT, '0.0.0.0', () => {
-  console.log(JSON.stringify({ event: 'storage-index-listening', port: PORT, file: INDEX_FILE, entries: entries.size }));
+server.listen({ port: PORT, host: '::', ipv6Only: false }, () => {
+  console.log(JSON.stringify({ event: 'storage-index-listening', port: PORT, host: '::', file: INDEX_FILE, entries: entries.size }));
 });
