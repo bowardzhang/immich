@@ -142,6 +142,57 @@ async function getServiceSource(serviceId) {
   return { repo: source.repo, branch: trigger.branch, triggerRepository: trigger.repository };
 }
 
+async function ensureDeploymentTrigger(serviceId, index) {
+  const source = await getServiceSource(serviceId);
+  const triggerRepoMatches = !source.triggerRepository || source.triggerRepository === REPO;
+  if (source.repo === REPO && source.branch === BRANCH && triggerRepoMatches) {
+    return source;
+  }
+
+  console.warn(
+    JSON.stringify({
+      event: 'storage-provision',
+      action: 'create-deployment-trigger',
+      index,
+      serviceId,
+      expectedRepo: REPO,
+      expectedBranch: BRANCH,
+      currentRepo: source.repo || null,
+      currentBranch: source.branch || null,
+    }),
+  );
+
+  const data = await gql(
+    `mutation deploymentTriggerCreate($input: DeploymentTriggerCreateInput!) {
+      deploymentTriggerCreate(input: $input) { id repository branch serviceId environmentId }
+    }`,
+    {
+      input: {
+        projectId: PROJECT_ID,
+        environmentId: ENVIRONMENT_ID,
+        serviceId,
+        provider: 'github',
+        repository: REPO,
+        branch: BRANCH,
+      },
+    },
+  );
+
+  const trigger = data.deploymentTriggerCreate;
+  console.log(
+    JSON.stringify({
+      event: 'storage-provision',
+      action: 'deployment-trigger-created',
+      index,
+      serviceId,
+      triggerId: trigger?.id || null,
+      repo: trigger?.repository || REPO,
+      branch: trigger?.branch || BRANCH,
+    }),
+  );
+  return trigger;
+}
+
 async function waitForExpectedSource(serviceId, index) {
   const deadline = Date.now() + SOURCE_VERIFY_TIMEOUT_MS;
   let lastSource = {};
@@ -188,6 +239,7 @@ async function configureService(serviceId) {
       serviceId,
       environmentId: ENVIRONMENT_ID,
       input: {
+        source: { repo: REPO },
         rootDirectory: ROOT_DIRECTORY,
         startCommand: 'node server.mjs',
         healthcheckPath: '/health',
@@ -364,6 +416,7 @@ export async function ensureNextVolume(currentNodes, force = false) {
     }
 
     await configureService(service.id);
+    await ensureDeploymentTrigger(service.id, index);
     const source = await waitForExpectedSource(service.id, index);
     console.log(
       JSON.stringify({
