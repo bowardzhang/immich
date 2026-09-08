@@ -1,21 +1,21 @@
 import http from 'node:http';
-import crypto from 'node:crypto';
 import { createReadStream, createWriteStream } from 'node:fs';
 import { mkdtemp, rm, stat } from 'node:fs/promises';
+import { basename } from 'node:path';
 import { tmpdir } from 'node:os';
 import { PassThrough } from 'node:stream';
 
 const PORT = Number(process.env.PORT || 8080);
 const TOKEN = process.env.REMOTE_STORAGE_TOKEN || '';
-const WARNING_PERCENT = Number(process.env.STORAGE_WARNING_PERCENT || 85);
-const CRITICAL_PERCENT = Number(process.env.STORAGE_CRITICAL_PERCENT || 95);
-const CHECK_INTERVAL_MS = Number(process.env.STORAGE_CHECK_INTERVAL_MS || 15 * 60 * 1000);
-const SELF_TEST_DELAY_MS = Number(process.env.STORAGE_SELF_TEST_DELAY_MS || 30 * 1000);
-const ALERT_EMAIL_TO = process.env.ALERT_EMAIL_TO || '';
-const RESEND_API_KEY = process.env.RESEND_API_KEY || '';
-const ALERT_EMAIL_FROM = process.env.ALERT_EMAIL_FROM || 'Immich Storage <onboarding@resend.dev>';
 const ALLOCATION_SAFETY_BYTES = Number(process.env.STORAGE_ALLOCATION_SAFETY_BYTES || 64 * 1024 * 1024);
 const MAX_UPLOAD_SPOOL_BYTES = Number(process.env.STORAGE_MAX_UPLOAD_SPOOL_BYTES || 50 * 1024 ** 3);
+const NODE_REQUEST_TIMEOUT_MS = Number(process.env.STORAGE_NODE_REQUEST_TIMEOUT_MS || 12_000);
+const NODE_COLD_RETRY_DELAY_MS = Number(process.env.STORAGE_NODE_COLD_RETRY_DELAY_MS || 1_500);
+const DEFAULT_NODE_CAPACITY_BYTES = Number(process.env.STORAGE_NODE_CAPACITY_BYTES || 4_838_498_304);
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 function parseNodes() {
   const parsed = JSON.parse(process.env.STORAGE_NODES || '[]');
@@ -25,82 +25,157 @@ function parseNodes() {
     name: node.name || `volume-${index + 1}`,
     url: String(node.url).replace(/\/$/, ''),
     token: node.token || TOKEN,
+    configuredCapacityBytes: Number(node.capacityBytes || DEFAULT_NODE_CAPACITY_BYTES),
     healthy: true,
     lastError: null,
     lastCheckedAt: null,
+    lastStorage: null,
   }));
 }
 
 const nodes = parseNodes();
-let lastAlertLevel = 'normal';
-let provisioningInProgress = false;
+const pathCache = new Map();
 
 function headers(node, extra = {}) {
   return { ...(node.token ? { authorization: `Bearer ${node.token}` } : {}), ...extra };
 }
 
-async function request(node, pathname, init = {}) {
+async function nodeFetch(node, pathname, init = {}, retries = 0) {
   const target = `${node.url}${pathname}`;
-  try {
-    const response = await fetch(target, { ...init, headers: headers(node, init.headers || {}) });
-    node.healthy = true;
-    node.lastError = null;
-    node.lastCheckedAt = new Date().toISOString();
-    return response;
-  } catch (error) {
-    node.healthy = false;
-    node.lastError = error instanceof Error ? error.message : String(error);
-    node.lastCheckedAt = new Date().toISOString();
-    const cause = error?.cause;
-    const details = [error?.message, cause?.code, cause?.message, cause?.address, cause?.port].filter(Boolean).join(' | ');
-    throw new Error(`${node.name} upstream request failed (${target}): ${details || String(error)}`);
+  let lastError;
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      const response = await fetch(target, {
+        ...init,
+        headers: headers(node, init.headers || {}),
+        signal: init.signal || AbortSignal.timeout(NODE_REQUEST_TIMEOUT_MS),
+      });
+      node.healthy = true;
+      node.lastError = null;
+      node.lastCheckedAt = new Date().toISOString();
+      return response;
+    } catch (error) {
+      lastError = error;
+      node.healthy = false;
+      node.lastError = error instanceof Error ? error.message : String(error);
+      node.lastCheckedAt = new Date().toISOString();
+      if (attempt < retries) await sleep(NODE_COLD_RETRY_DELAY_MS);
+    }
   }
+  const cause = lastError?.cause;
+  const details = [lastError?.message, cause?.code, cause?.message, cause?.address, cause?.port].filter(Boolean).join(' | ');
+  throw new Error(`${node.name} upstream request failed (${target}): ${details || String(lastError)}`);
 }
 
-async function findFile(relative) {
-  const pathname = `/api/file?path=${encodeURIComponent(relative)}`;
-  for (const node of nodes) {
+async function headOnNode(node, relative) {
+  const response = await nodeFetch(node, `/api/file?path=${encodeURIComponent(relative)}`, { method: 'HEAD' }, 1);
+  return response.ok ? response : null;
+}
+
+async function findExactFile(relative) {
+  const cached = pathCache.get(relative);
+  if (cached) {
     try {
-      const response = await request(node, pathname, { method: 'HEAD' });
-      if (response.ok) return { node, response };
-      if (response.status !== 404) console.warn(`File lookup ${node.name}: ${response.status} ${response.statusText}`);
-    } catch (error) {
-      console.warn(`File lookup ${node.name} skipped: ${error.message}`);
+      const response = await headOnNode(cached.node, cached.path);
+      if (response) return { node: cached.node, response, path: cached.path, via: 'cache' };
+    } catch {}
+    pathCache.delete(relative);
+  }
+
+  const results = await Promise.allSettled(nodes.map(async (node) => {
+    const response = await headOnNode(node, relative);
+    return response ? { node, response, path: relative, via: 'exact' } : null;
+  }));
+
+  for (const result of results) {
+    if (result.status === 'fulfilled' && result.value) {
+      pathCache.set(relative, { node: result.value.node, path: relative });
+      return result.value;
     }
   }
   return null;
 }
 
+async function findUniqueBasename(relative) {
+  const name = basename(relative);
+  if (!name || name === '.' || name === '/') return null;
+
+  const results = await Promise.allSettled(nodes.map(async (node) => {
+    const response = await nodeFetch(node, '/api/list?path=&recursive=true', {}, 1);
+    if (!response.ok) return [];
+    const data = await response.json();
+    return (data.entries || [])
+      .filter((entry) => entry?.type === 'file' && basename(String(entry.path || '')) === name)
+      .map((entry) => ({ node, path: String(entry.path) }));
+  }));
+
+  const matches = results.flatMap((result) => result.status === 'fulfilled' ? result.value : []);
+  if (matches.length !== 1) {
+    console.warn(JSON.stringify({
+      event: 'storage-basename-fallback',
+      requestedPath: relative,
+      basename: name,
+      matches: matches.length,
+      result: matches.length === 0 ? 'not-found' : 'ambiguous',
+    }));
+    return null;
+  }
+
+  const match = matches[0];
+  const response = await headOnNode(match.node, match.path);
+  if (!response) return null;
+  pathCache.set(relative, { node: match.node, path: match.path });
+  console.warn(JSON.stringify({
+    event: 'storage-basename-fallback',
+    requestedPath: relative,
+    resolvedPath: match.path,
+    node: match.node.name,
+    result: 'unique-match',
+  }));
+  return { node: match.node, response, path: match.path, via: 'basename' };
+}
+
+async function findReadableFile(relative) {
+  return (await findExactFile(relative)) || (await findUniqueBasename(relative));
+}
+
 async function getStatus(node) {
   try {
-    const response = await request(node, '/api/storage');
+    const response = await nodeFetch(node, '/api/storage', {}, 1);
     if (!response.ok) throw new Error(`${node.name}: ${response.status} ${response.statusText}`);
     const data = await response.json();
-    const totalBytes = Number(data.totalBytes || 0);
+    const capacityBytes = Number(data.totalBytes || node.configuredCapacityBytes || DEFAULT_NODE_CAPACITY_BYTES);
     const availableBytes = Number(data.availableBytes || data.freeBytes || 0);
-    const usedBytes = Math.max(0, totalBytes - availableBytes);
-    return {
+    const usedBytes = Math.max(0, capacityBytes - availableBytes);
+    const storage = {
       name: node.name,
       url: node.url,
       healthy: true,
+      stale: false,
       lastError: null,
       lastCheckedAt: node.lastCheckedAt,
       usedBytes,
       availableBytes,
-      capacityBytes: totalBytes,
-      usagePercent: totalBytes > 0 ? (usedBytes / totalBytes) * 100 : 100,
+      capacityBytes,
+      usagePercent: capacityBytes > 0 ? (usedBytes / capacityBytes) * 100 : 100,
     };
+    node.lastStorage = storage;
+    return storage;
   } catch (error) {
+    const capacityBytes = node.lastStorage?.capacityBytes || node.configuredCapacityBytes || DEFAULT_NODE_CAPACITY_BYTES;
+    const availableBytes = node.lastStorage?.availableBytes || 0;
+    const usedBytes = Math.max(0, capacityBytes - availableBytes);
     return {
       name: node.name,
       url: node.url,
       healthy: false,
-      lastError: error.message,
+      stale: true,
+      lastError: error instanceof Error ? error.message : String(error),
       lastCheckedAt: node.lastCheckedAt,
-      usedBytes: 0,
-      availableBytes: 0,
-      capacityBytes: 0,
-      usagePercent: 100,
+      usedBytes,
+      availableBytes,
+      capacityBytes,
+      usagePercent: capacityBytes > 0 ? (usedBytes / capacityBytes) * 100 : 100,
     };
   }
 }
@@ -120,33 +195,29 @@ async function putWithFailover(relative, spoolFile, headersIn, requiredBytes = 0
   for (const { node } of candidates) {
     try {
       const body = createReadStream(spoolFile);
-      const upstream = await request(node, `/api/file?path=${encodeURIComponent(relative)}`, {
-        method: 'PUT',
-        body,
-        duplex: 'half',
-        headers: headersIn,
+      const upstream = await nodeFetch(node, `/api/file?path=${encodeURIComponent(relative)}`, {
+        method: 'PUT', body, duplex: 'half', headers: headersIn,
       });
-      if (upstream.ok || upstream.status < 500) return { node, upstream };
+      if (upstream.ok || upstream.status < 500) {
+        pathCache.set(relative, { node, path: relative });
+        return { node, upstream };
+      }
       lastError = new Error(`${node.name}: upstream returned ${upstream.status} ${upstream.statusText}`);
     } catch (error) {
       lastError = error;
     }
-    console.warn(`PUT failover: ${node.name} failed; trying next eligible volume`);
   }
   throw lastError || new Error('All storage volumes rejected the write');
 }
 
 async function streamPutWithSpoolFailover(relative, req, contentLength = 0) {
-  if (contentLength > MAX_UPLOAD_SPOOL_BYTES) {
-    throw new Error(`Upload exceeds STORAGE_MAX_UPLOAD_SPOOL_BYTES (${MAX_UPLOAD_SPOOL_BYTES} bytes)`);
-  }
-
+  if (contentLength > MAX_UPLOAD_SPOOL_BYTES) throw new Error(`Upload exceeds STORAGE_MAX_UPLOAD_SPOOL_BYTES (${MAX_UPLOAD_SPOOL_BYTES} bytes)`);
   const candidates = await candidateNodes(contentLength);
   if (candidates.length === 0) throw new Error('No healthy storage volume is currently eligible for this write');
+
   const primary = candidates[0].node;
   const dir = await mkdtemp(`${tmpdir()}/storage-router-upload-`);
   const file = `${dir}/payload.bin`;
-  const startedAt = Date.now();
   const spool = createWriteStream(file);
   const upstreamBody = new PassThrough();
   const contentType = req.headers['content-type'] || 'application/octet-stream';
@@ -155,87 +226,52 @@ async function streamPutWithSpoolFailover(relative, req, contentLength = 0) {
     ...(contentLength > 0 ? { 'content-length': String(contentLength) } : {}),
   };
 
-  let primarySettled = false;
-  const primaryPromise = request(primary, `/api/file?path=${encodeURIComponent(relative)}`, {
-    method: 'PUT',
-    body: upstreamBody,
-    duplex: 'half',
-    headers: primaryHeaders,
-  }).then((upstream) => {
-    primarySettled = true;
-    if (!upstream.ok && upstream.status >= 500) {
-      req.unpipe(upstreamBody);
-      upstreamBody.destroy();
-    }
-    return { upstream, error: null };
-  }).catch((error) => {
-    primarySettled = true;
-    req.unpipe(upstreamBody);
-    upstreamBody.destroy();
-    return { upstream: null, error };
-  });
+  const primaryPromise = nodeFetch(primary, `/api/file?path=${encodeURIComponent(relative)}`, {
+    method: 'PUT', body: upstreamBody, duplex: 'half', headers: primaryHeaders,
+  }).then((upstream) => ({ upstream, error: null })).catch((error) => ({ upstream: null, error }));
 
   try {
     req.pipe(spool);
     req.pipe(upstreamBody);
     await new Promise((resolve, reject) => {
-      const cleanup = () => {
-        spool.off('finish', onFinish);
-        spool.off('error', onError);
-        req.off('error', onError);
-        req.off('aborted', onAborted);
-      };
-      const onFinish = () => { cleanup(); resolve(); };
-      const onError = (error) => { cleanup(); reject(error); };
-      const onAborted = () => { cleanup(); reject(new Error('Client aborted upload')); };
+      const onFinish = () => resolve();
+      const onError = (error) => reject(error);
+      const onAborted = () => reject(new Error('Client aborted upload'));
       spool.once('finish', onFinish);
       spool.once('error', onError);
       req.once('error', onError);
       req.once('aborted', onAborted);
     });
+    upstreamBody.end();
 
     const fileStat = await stat(file);
     const actualBytes = fileStat.size;
-    if (actualBytes > MAX_UPLOAD_SPOOL_BYTES) {
-      req.unpipe(upstreamBody);
-      upstreamBody.destroy();
-      throw new Error(`Upload exceeds STORAGE_MAX_UPLOAD_SPOOL_BYTES (${MAX_UPLOAD_SPOOL_BYTES} bytes)`);
-    }
-    if (contentLength > 0 && actualBytes !== contentLength) {
-      req.unpipe(upstreamBody);
-      upstreamBody.destroy();
-      throw new Error(`Upload size mismatch: declared=${contentLength} bytes actual=${actualBytes} bytes`);
-    }
+    if (actualBytes > MAX_UPLOAD_SPOOL_BYTES) throw new Error(`Upload exceeds STORAGE_MAX_UPLOAD_SPOOL_BYTES (${MAX_UPLOAD_SPOOL_BYTES} bytes)`);
+    if (contentLength > 0 && actualBytes !== contentLength) throw new Error(`Upload size mismatch: declared=${contentLength} actual=${actualBytes}`);
 
-    if (!primarySettled) upstreamBody.end();
     const primaryResult = await primaryPromise;
     if (primaryResult.upstream && (primaryResult.upstream.ok || primaryResult.upstream.status < 500)) {
-      console.log(JSON.stringify({ event: 'storage-put', mode: 'streamed-primary', node: primary.name, bytes: actualBytes, durationMs: Date.now() - startedAt }));
-      return { node: primary, upstream: primaryResult.upstream, dir, file, actualBytes };
+      pathCache.set(relative, { node: primary, path: relative });
+      return { node: primary, upstream: primaryResult.upstream, dir };
     }
 
-    const failoverHeaders = {
+    const { node, upstream } = await putWithFailover(relative, file, {
       'content-type': contentType,
       'content-length': String(actualBytes),
-    };
-    const { node, upstream } = await putWithFailover(relative, file, failoverHeaders, actualBytes, new Set([primary]));
-    console.log(JSON.stringify({ event: 'storage-put', mode: 'spool-failover', node: node.name, primary: primary.name, bytes: actualBytes, durationMs: Date.now() - startedAt, primaryError: primaryResult.error?.message || (primaryResult.upstream ? `${primaryResult.upstream.status} ${primaryResult.upstream.statusText}` : null) }));
-    return { node, upstream, dir, file, actualBytes };
+    }, actualBytes, new Set([primary]));
+    return { node, upstream, dir };
   } catch (error) {
     req.unpipe(spool);
     req.unpipe(upstreamBody);
     upstreamBody.destroy();
     if (!spool.destroyed) spool.destroy();
-    let partialBytes = 0;
-    try { partialBytes = (await stat(file)).size; } catch {}
-    console.warn(JSON.stringify({ event: 'storage-put', mode: 'aborted-or-error', node: primary.name, partialBytes, durationMs: Date.now() - startedAt, error: error instanceof Error ? error.message : String(error) }));
     await rm(dir, { recursive: true, force: true }).catch(() => {});
     throw error;
   }
 }
 
 function json(res, status, body) {
-  res.writeHead(status, { 'content-type': 'application/json' });
+  res.writeHead(status, { 'content-type': 'application/json', 'cache-control': 'no-store' });
   res.end(JSON.stringify(body));
 }
 
@@ -259,92 +295,16 @@ async function poolStatus() {
   return Promise.all(nodes.map(getStatus));
 }
 
-async function runNodeSelfTest(node) {
-  const payload = `storage-router-selftest:${Date.now()}:${crypto.randomUUID()}`;
-  const path = `.storage-router-selftest/${Date.now()}-${crypto.randomUUID()}.txt`;
-  const encoded = encodeURIComponent(path);
-  let written = false;
-  try {
-    const put = await request(node, `/api/file?path=${encoded}`, {
-      method: 'PUT',
-      body: payload,
-      headers: { 'content-type': 'text/plain; charset=utf-8', 'content-length': String(Buffer.byteLength(payload)) },
-    });
-    if (!put.ok) throw new Error(`PUT ${put.status} ${put.statusText}`);
-    written = true;
-    const head = await request(node, `/api/file?path=${encoded}`, { method: 'HEAD' });
-    if (!head.ok) throw new Error(`HEAD ${head.status} ${head.statusText}`);
-    const get = await request(node, `/api/file?path=${encoded}`);
-    if (!get.ok) throw new Error(`GET ${get.status} ${get.statusText}`);
-    const body = await get.text();
-    if (body !== payload) throw new Error('GET content mismatch');
-    const del = await request(node, `/api/file?path=${encoded}`, { method: 'DELETE' });
-    if (!del.ok) throw new Error(`DELETE ${del.status} ${del.statusText}`);
-    written = false;
-    console.log(JSON.stringify({ event: 'storage-self-test', node: node.name, result: 'PASS' }));
-    return true;
-  } catch (error) {
-    console.error(JSON.stringify({ event: 'storage-self-test', node: node.name, result: 'FAIL', error: error.message }));
-    return false;
-  } finally {
-    if (written) {
-      try { await request(node, `/api/file?path=${encoded}`, { method: 'DELETE' }); } catch {}
-    }
-  }
-}
-
-async function runBackgroundSelfTest() {
-  const results = await Promise.all(nodes.map(runNodeSelfTest));
-  console.log(JSON.stringify({ event: 'storage-self-test-summary', passed: results.filter(Boolean).length, total: results.length }));
-}
-
-async function sendAlert(statuses) {
-  if (!RESEND_API_KEY || !ALERT_EMAIL_TO) return false;
-  const level = statuses.every((item) => item.usagePercent >= CRITICAL_PERCENT) ? 'critical' : 'warning';
-  if (level === lastAlertLevel) return false;
-  const atLimit = nodes.length >= 10;
-  const subject = atLimit
-    ? 'Immich storage is full — Railway Hobby volume limit reached'
-    : level === 'critical'
-      ? 'Immich storage is critically full — automatic expansion required'
-      : 'Immich storage capacity warning — automatic expansion preparing';
-  const lines = statuses.map((item) => `${item.name}: ${item.healthy ? `${item.usagePercent.toFixed(1)}% (${(item.usedBytes / 1024 ** 3).toFixed(2)} / ${(item.capacityBytes / 1024 ** 3).toFixed(2)} GiB used)` : `UNHEALTHY (${item.lastError || 'unknown error'})`}`).join('\n');
-  const action = atLimit
-    ? 'All 10 configured volumes are in the warning range. Railway Hobby cannot add an 11th volume; migrate/resize storage or upgrade the plan.'
-    : 'The Storage Router provisioning controller should create the next Photo Storage service and volume automatically when Railway API provisioning is enabled.';
-  const text = `${subject}\n\n${lines}\n\n${action}`;
-  const response = await fetch('https://api.resend.com/emails', {
-    method: 'POST',
-    headers: { authorization: `Bearer ${RESEND_API_KEY}`, 'content-type': 'application/json' },
-    body: JSON.stringify({ from: ALERT_EMAIL_FROM, to: [ALERT_EMAIL_TO], subject, text }),
-  });
-  if (!response.ok) throw new Error(`Resend returned ${response.status}`);
-  lastAlertLevel = level;
-  return true;
-}
-
-async function monitor() {
-  try {
-    const statuses = await poolStatus();
-    const allWarning = statuses.every((item) => item.usagePercent >= WARNING_PERCENT);
-    const allCritical = statuses.every((item) => item.usagePercent >= CRITICAL_PERCENT);
-    const healthyCount = statuses.filter((item) => item.healthy).length;
-    if (!allWarning && healthyCount === statuses.length) lastAlertLevel = 'normal';
-    if (allWarning || healthyCount < statuses.length) await sendAlert(statuses);
-    console.log(JSON.stringify({ event: 'storage-status', statuses, allWarning, allCritical, healthyCount, volumeLimitReached: nodes.length >= 10, provisioningInProgress }));
-  } catch (error) {
-    console.error('Storage monitor failed:', error);
-  }
-}
-
 const server = http.createServer(async (req, res) => {
   try {
     const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
     const relative = url.searchParams.get('path') || '';
+
     if (req.method === 'GET' && url.pathname === '/health') {
-      return json(res, 200, { ok: true, nodes: nodes.length, healthyNodes: nodes.filter((node) => node.healthy).length, maxVolumes: 10 });
+      return json(res, 200, { ok: true, nodes: nodes.length, fixedNodePool: true });
     }
     if (TOKEN && req.headers.authorization !== `Bearer ${TOKEN}`) return json(res, 401, { error: 'Unauthorized' });
+
     if (req.method === 'GET' && url.pathname === '/api/storage') {
       const statuses = await poolStatus();
       return json(res, 200, {
@@ -354,27 +314,23 @@ const server = http.createServer(async (req, res) => {
         volumes: statuses,
       });
     }
+
     if (req.method === 'GET' && url.pathname === '/api/storage/status') {
       const statuses = await poolStatus();
-      return json(res, 200, {
-        volumes: statuses,
-        maxVolumes: 10,
-        warningPercent: WARNING_PERCENT,
-        criticalPercent: CRITICAL_PERCENT,
-        nextVolumeRecommended: nodes.length < 10 && statuses.every((item) => item.usagePercent >= WARNING_PERCENT),
-        volumeLimitReached: nodes.length >= 10,
-        provisioningInProgress,
-      });
+      return json(res, 200, { volumes: statuses, maxVolumes: nodes.length, fixedNodePool: true });
     }
+
     if ((req.method === 'GET' || req.method === 'HEAD') && url.pathname === '/api/file') {
-      const found = await findFile(relative);
+      const found = await findReadableFile(relative);
       if (!found) return json(res, 404, { error: 'File not found' });
-      const upstream = await request(found.node, `/api/file?path=${encodeURIComponent(relative)}`, {
+      const upstream = await nodeFetch(found.node, `/api/file?path=${encodeURIComponent(found.path)}`, {
         method: req.method,
         headers: req.headers.range ? { range: req.headers.range } : {},
-      });
+      }, 1);
+      if (found.via === 'basename') upstream.headers.set('x-storage-resolved-path', found.path);
       return proxyResponse(res, upstream);
     }
+
     if (req.method === 'PUT' && url.pathname === '/api/file') {
       const declaredBytes = Number(req.headers['content-length'] || 0);
       const contentLength = Number.isFinite(declaredBytes) && declaredBytes > 0 ? declaredBytes : 0;
@@ -385,78 +341,91 @@ const server = http.createServer(async (req, res) => {
         await rm(result.dir, { recursive: true, force: true }).catch(() => {});
       }
     }
+
     if (req.method === 'DELETE' && url.pathname === '/api/file') {
-      const found = await findFile(relative);
+      const found = await findExactFile(relative);
       if (!found) return json(res, 404, { error: 'File not found' });
-      const upstream = await request(found.node, `/api/file?path=${encodeURIComponent(relative)}`, { method: 'DELETE' });
+      const upstream = await nodeFetch(found.node, `/api/file?path=${encodeURIComponent(relative)}`, { method: 'DELETE' });
+      if (upstream.ok) pathCache.delete(relative);
       return proxyResponse(res, upstream);
     }
+
     if (req.method === 'MOVE' && url.pathname === '/api/file') {
       const source = url.searchParams.get('source') || '';
-      const found = await findFile(source);
+      const found = await findExactFile(source);
       if (!found) return json(res, 404, { error: 'Source file not found' });
+
       const sourceSize = Number(found.response.headers.get('content-length') || 0);
       const candidates = await candidateNodes(Number.isFinite(sourceSize) ? sourceSize : 0, new Set([found.node]));
       if (candidates.length === 0) {
-        const upstream = await request(found.node, `/api/file?path=${encodeURIComponent(relative)}&source=${encodeURIComponent(source)}`, { method: 'MOVE' });
+        const upstream = await nodeFetch(found.node, `/api/file?path=${encodeURIComponent(relative)}&source=${encodeURIComponent(source)}`, { method: 'MOVE' });
+        if (upstream.ok) {
+          pathCache.delete(source);
+          pathCache.set(relative, { node: found.node, path: relative });
+        }
         return proxyResponse(res, upstream);
       }
+
       let lastError;
       for (const { node: targetNode } of candidates) {
         try {
-          const sourceResponse = await request(found.node, `/api/file?path=${encodeURIComponent(source)}`);
+          const sourceResponse = await nodeFetch(found.node, `/api/file?path=${encodeURIComponent(source)}`);
           if (!sourceResponse.ok || !sourceResponse.body) throw new Error(`Unable to read source: ${sourceResponse.status}`);
-          const uploadHeaders = {
-            'content-type': sourceResponse.headers.get('content-type') || 'application/octet-stream',
-            ...(sourceResponse.headers.get('content-length') ? { 'content-length': sourceResponse.headers.get('content-length') } : {}),
-          };
-          const uploadResponse = await request(targetNode, `/api/file?path=${encodeURIComponent(relative)}`, {
+          const uploadResponse = await nodeFetch(targetNode, `/api/file?path=${encodeURIComponent(relative)}`, {
             method: 'PUT',
             body: sourceResponse.body,
             duplex: 'half',
-            headers: uploadHeaders,
+            headers: {
+              'content-type': sourceResponse.headers.get('content-type') || 'application/octet-stream',
+              ...(sourceResponse.headers.get('content-length') ? { 'content-length': sourceResponse.headers.get('content-length') } : {}),
+            },
           });
           if (!uploadResponse.ok) throw new Error(`${targetNode.name}: target write ${uploadResponse.status}`);
-          const deleteResponse = await request(found.node, `/api/file?path=${encodeURIComponent(source)}`, { method: 'DELETE' });
+          const deleteResponse = await nodeFetch(found.node, `/api/file?path=${encodeURIComponent(source)}`, { method: 'DELETE' });
           if (!deleteResponse.ok) throw new Error(`source deletion failed: ${deleteResponse.status}`);
+          pathCache.delete(source);
+          pathCache.set(relative, { node: targetNode, path: relative });
           return json(res, 200, { source, path: relative, node: targetNode.name });
         } catch (error) {
           lastError = error;
-          console.warn(`MOVE failover: ${targetNode.name} failed; trying next target`);
         }
       }
       throw lastError || new Error('Cross-volume MOVE failed');
     }
+
     if (req.method === 'GET' && url.pathname === '/api/list') {
       const recursive = url.searchParams.get('recursive') === 'true';
+      const results = await Promise.allSettled(nodes.map(async (node) => {
+        const upstream = await nodeFetch(node, `/api/list?path=${encodeURIComponent(relative)}&recursive=${recursive}`, {}, 1);
+        if (!upstream.ok) return [];
+        const data = await upstream.json();
+        return data.entries || [];
+      }));
       const merged = new Map();
-      for (const node of nodes) {
-        try {
-          const upstream = await request(node, `/api/list?path=${encodeURIComponent(relative)}&recursive=${recursive}`);
-          if (!upstream.ok) continue;
-          const data = await upstream.json();
-          for (const entry of data.entries || []) merged.set(entry.path, entry);
-        } catch (error) {
-          console.warn(`List ${node.name} skipped: ${error.message}`);
-        }
+      for (const result of results) {
+        if (result.status !== 'fulfilled') continue;
+        for (const entry of result.value) merged.set(entry.path, entry);
       }
       return json(res, 200, { entries: [...merged.values()] });
     }
+
     return json(res, 404, { error: 'Not found' });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    const status = message.includes('No healthy storage volume')
-      ? 507
-      : message.includes('STORAGE_MAX_UPLOAD_SPOOL_BYTES')
-        ? 413
-        : 500;
+    const status = message.includes('No healthy storage volume') ? 507 : message.includes('STORAGE_MAX_UPLOAD_SPOOL_BYTES') ? 413 : 500;
     return json(res, status, { error: message });
   }
 });
 
 server.listen(PORT, '0.0.0.0', () => {
+  console.log(JSON.stringify({
+    event: 'storage-router-mode',
+    mode: 'serverless-request-driven',
+    fixedNodePool: true,
+    nodes: nodes.length,
+    automaticProvisioning: false,
+    capacityFallbackBytesPerNode: DEFAULT_NODE_CAPACITY_BYTES,
+    basenameReadFallback: 'unique-match-only',
+  }));
   console.log(`Storage router listening on ${PORT}`);
-  setTimeout(() => void runBackgroundSelfTest(), SELF_TEST_DELAY_MS).unref();
 });
-setInterval(monitor, CHECK_INTERVAL_MS).unref();
-void monitor();
