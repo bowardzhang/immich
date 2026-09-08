@@ -54,7 +54,7 @@ When `REMOTE_STORAGE_URL` is enabled, Immich's storage API reports the combined 
 
 ### Automatic expansion
 
-When every configured storage node is healthy and above the warning threshold, the provisioner can create the next `Photo Storage N`, attach a persistent volume, deploy it, verify health and add it to the router.
+Automatic expansion is proactive: when all healthy storage nodes reach **82%**, the provisioner starts creating or recovering the next `Photo Storage N` before the normal 85% warning threshold. The critical threshold remains 95%.
 
 ```mermaid
 sequenceDiagram
@@ -63,9 +63,9 @@ sequenceDiagram
     participant Node as Photo Storage N
     participant Router as Storage Router
 
-    Monitor->>Monitor: all nodes >= warning threshold
-    Monitor->>Railway: create service with repo + branch
-    Railway->>Railway: attach persistent volume
+    Monitor->>Monitor: all healthy nodes >= 82%
+    Monitor->>Railway: create/recover service and verify repo + branch
+    Railway->>Railway: create or reuse exactly one persistent volume
     Monitor->>Railway: deploy
     Monitor->>Railway: poll deployment status
     Railway-->>Monitor: SUCCESS
@@ -75,19 +75,22 @@ sequenceDiagram
     Monitor->>Railway: redeploy Router
 ```
 
-The creation request explicitly supplies the configured GitHub repository and branch. The default branch fallback is `3.1.0-remote`.
+The expansion controller checks every **60 seconds**. If provisioning fails after the trigger is reached, it retries after **15 seconds**. Creation and recovery explicitly verify the GitHub repository and `3.1.0-remote` deployment branch, preventing a partially configured service from being deployed against the wrong or missing branch.
 
 ### Monitoring and alerts
 
 Each Photo Storage node reports actual filesystem capacity. The router logs per-node health, used bytes, free bytes and usage percentage, and can send warning/critical email alerts through Resend.
 
-Default thresholds:
+Current defaults:
 
 | Setting | Default |
 |---|---:|
+| Proactive expansion trigger | 82% |
 | Warning | 85% |
 | Critical | 95% |
-| Capacity check interval | 15 minutes |
+| Capacity check interval | 60 seconds |
+| Provisioning check interval | 60 seconds |
+| Provisioning retry after failure | 15 seconds |
 | Max storage nodes | 10 |
 | Allocation safety margin | 64 MiB |
 
@@ -100,11 +103,13 @@ flowchart LR
     A[Immich writes logical path] --> B[Storage Router]
     B --> C{Healthy nodes with enough free space}
     C --> D[Choose most free space]
-    D --> E[Stream upload]
-    E --> F{Success?}
-    F -- Yes --> G[Return success]
-    F -- No --> H[Retry another eligible node]
+    D --> E[Stream upload + temporary spool]
+    E --> F{Primary upload succeeds?}
+    F -- Yes --> G[Return success + clean spool]
+    F -- No --> H[Replay spool to another eligible node]
 ```
+
+The router streams the request to the selected Photo Storage node while simultaneously spooling the same bytes to ephemeral `/tmp`. The normal success path does not require a second full copy; the spool is replayed only if the primary node fails. Client-aborted uploads clean up unfinished temporary files.
 
 ### Existing file access
 
@@ -169,6 +174,22 @@ ALERT_EMAIL_FROM
 
 See [`storage-router/README.md`](storage-router/README.md) for the complete reference.
 
+## Automatic expansion recovery
+
+The provisioner is designed to recover partially completed expansion attempts rather than only handling brand-new services:
+
+1. Determine the next `Photo Storage N`.
+2. Reuse an existing service if it was already created.
+3. Explicitly verify the GitHub repository and deployment branch trigger.
+4. Reuse the existing persistent volume if exactly one is already attached; do not attach a second one accidentally.
+5. Configure the `/photo-storage` root directory, environment variables, and `/photos_extern` mount.
+6. Start deployment and poll it to a terminal state.
+7. Add the node to `STORAGE_NODES` only after deployment reaches `SUCCESS` and `/health` succeeds.
+8. Update Router configuration and redeploy Storage Router.
+9. Retry recoverable provisioning failures after 15 seconds while the capacity trigger remains active.
+
+This prevents a half-created service, volume, or deployment from leaving automatic expansion permanently stuck.
+
 ## Cleanup and persistence policy
 
 Temporary data is intentionally kept away from persistent Photo Storage volumes where possible:
@@ -195,6 +216,10 @@ flowchart TD
 ```
 
 Provisioning has separate deployment and health timeouts. A newly created node is not appended to the active Router list until deployment reaches `SUCCESS` and `/health` responds successfully.
+
+## Railway Watch Paths
+
+Production services use Railway Watch Paths so documentation, tests, or unrelated application changes do not cause unnecessary storage-service restarts. Storage Router watches only files that actually affect its production image. README and test-only changes therefore do not restart the production Router, which is useful while mobile backups are running.
 
 ## Upgrade model
 
@@ -230,4 +255,12 @@ The main development directions are:
 
 ## Current baseline
 
-As of 2026-09-07, this fork is based on upstream **Immich v3.1.0**, using production branch **`3.1.0-remote`**.
+As of 2026-09-08, this fork is based on upstream **Immich v3.1.0**, using production branch **`3.1.0-remote`**.
+
+
+## Related documentation
+
+- [中文版本（默认）](RAILWAY_REMOTE_STORAGE.md)
+- [Fork overview — English](README.en.md)
+- [Storage Router — English](storage-router/README.en.md)
+- [Official Immich documentation](https://docs.immich.app/)
