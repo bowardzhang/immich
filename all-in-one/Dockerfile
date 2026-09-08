@@ -79,6 +79,7 @@ COPY LICENSE /LICENSE
 COPY all-in-one/entrypoint.sh /usr/local/bin/immich-aio-entrypoint
 COPY all-in-one/supervisord.conf /etc/supervisor/conf.d/immich-aio.conf
 COPY all-in-one/healthcheck.sh /usr/local/bin/immich-aio-healthcheck
+COPY all-in-one/storage-index.mjs /usr/local/lib/immich-storage-index.mjs
 RUN chmod +x /usr/local/bin/immich-aio-entrypoint /usr/local/bin/immich-aio-healthcheck
 
 ENV PATH="${PATH}:/usr/src/app/server/bin" \
@@ -88,12 +89,14 @@ ENV PATH="${PATH}:/usr/src/app/server/bin" \
     REDIS_DATA_DIR=/persistent/redis \
     MACHINE_LEARNING_CACHE_FOLDER=/persistent/ml-cache \
     IMMICH_AIO_ENABLE_ML=false \
+    STORAGE_INDEX_PORT=3004 \
+    STORAGE_INDEX_FILE=/data/.aio/storage-index.json \
     DB_HOSTNAME=127.0.0.1 \
     DB_PORT=5432 \
     REDIS_HOSTNAME=127.0.0.1 \
     REDIS_PORT=6379 \
     IMMICH_MACHINE_LEARNING_URL=http://127.0.0.1:3003
 
-EXPOSE 2283
+EXPOSE 2283 3004
 ENTRYPOINT ["tini", "--", "/usr/local/bin/immich-aio-entrypoint"]
 HEALTHCHECK --interval=30s --timeout=10s --start-period=90s --retries=5 CMD ["/usr/local/bin/immich-aio-healthcheck"]
