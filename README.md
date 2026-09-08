@@ -1,5 +1,7 @@
 # Immich Railway 多卷存储 Fork
 
+<p align="center"><strong>简体中文</strong> · <a href="README.en.md">English</a></p>
+
 <p align="center">
   <a href="https://github.com/bowardzhang/immich/actions/workflows/storage-router-test.yml"><img src="https://img.shields.io/github/actions/workflow/status/bowardzhang/immich/storage-router-test.yml?branch=3.1.0-remote&style=for-the-badge&label=Storage%20Router%20Tests" alt="Storage Router 测试"></a>
   <a href="https://github.com/bowardzhang/immich/tree/3.1.0-remote"><img src="https://img.shields.io/badge/branch-3.1.0--remote-3F51B5?style=for-the-badge" alt="生产分支"></a>
