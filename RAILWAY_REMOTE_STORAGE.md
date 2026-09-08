@@ -1,5 +1,7 @@
 # Railway 多卷远程存储架构
 
+<p align="center"><strong>简体中文</strong> · <a href="RAILWAY_REMOTE_STORAGE.en.md">English</a></p>
+
 本文档说明本仓库相对于上游 Immich 增加的 Railway 多卷存储架构。标准 Immich 功能和用户操作请参考 [Immich 官方文档](https://docs.immich.app/)。
 
 ## 设计目标
