@@ -76,10 +76,14 @@ export class QueueService extends BaseService {
   }
 
   @OnEvent({ name: 'AppBootstrap', priority: BootstrapEventPriority.JobService })
-  onBootstrap() {
+  async onBootstrap() {
     this.jobRepository.setup(this.services);
     if (this.worker === ImmichWorker.Microservices) {
       this.jobRepository.startWorkers();
+      if (process.env.IMMICH_AIO_REPAIR_THUMBNAILS_ON_BOOT === 'true') {
+        this.logger.log('One-shot thumbnail repair requested; queueing forced regeneration for all assets');
+        await this.jobRepository.queue({ name: JobName.AssetGenerateThumbnailsQueueAll, data: { force: true } });
+      }
     } else if (this.worker === ImmichWorker.Api) {
       this.jobRepository.watchWorkers();
     }
