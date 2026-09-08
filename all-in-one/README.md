@@ -4,13 +4,17 @@ This image is designed for the `Family-Photos` Railway project to consolidate Im
 
 ## Safety / rollout
 
-The initial deployment runs without a Railway volume and uses ephemeral `/persistent` storage only for validation. Production database/media migration must happen only after the composite image is healthy and a verified logical PostgreSQL backup has been restored.
+The image has now passed an ephemeral validation deployment with local PostgreSQL, Redis, VectorChord/pgvector, the custom Immich server, and a read-only logical restore from the production database. The production cutover reuses the existing Immich `/data` Railway volume and stores local AIO state under `/data/.aio` while keeping Immich media at `/data`.
 
-Machine Learning is intentionally disabled by default (`IMMICH_AIO_ENABLE_ML=false`) during the first validation phase because the deployment rarely uses facial recognition or Smart Search. It will be added as an optional local process after the core server/database/Redis combination is stable.
+Machine Learning remains intentionally disabled during the first production cutover (`IMMICH_AIO_ENABLE_ML=false`) because facial recognition and Smart Search are rarely used. It will be added as an optional local process after the core server/database/Redis combination is stable.
 
 ## Shared volume layout
 
-- `/persistent/immich` — Immich local media/metadata files
-- `/persistent/postgres/data` — PostgreSQL cluster
-- `/persistent/redis` — Redis persistence
-- `/persistent/ml-cache` — optional ML cache
+Production Immich service:
+
+- `/data` — existing Immich media/system folders
+- `/data/.aio/postgres/data` — PostgreSQL cluster
+- `/data/.aio/redis` — Redis persistence
+- `/data/.aio/ml-cache` — optional ML cache
+
+Validation service defaults to the equivalent layout below `/persistent`.
