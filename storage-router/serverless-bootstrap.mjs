@@ -1,16 +1,9 @@
-// Serverless entry point for Railway.
-// This is also the steady-state mode restored after any one-shot provisioning run.
-// PS9 provisioning completed on 2026-09-08; normal request-driven mode is restored here.
+// Railway Serverless entry point for the fixed Photo Storage pool.
 //
-// The normal server keeps two background timers alive:
-//   1. a periodic pool monitor that calls /api/storage on every Photo Storage node;
-//   2. a delayed self-test that performs PUT/HEAD/GET/DELETE on every node.
-//
-// Those background calls wake sleeping Photo Storage services and also generate
-// outbound traffic from this service, which prevents Railway Serverless from
-// keeping the Router asleep.  In serverless mode we make the Router purely
-// request-driven: storage nodes are contacted only while handling an actual
-// Immich/API request.
+// The core router still contains optional background monitoring/self-test timers
+// for non-serverless/manual operation. In production we keep the Router purely
+// request-driven so it can sleep when Immich is idle and so it does not wake
+// sleeping Photo Storage nodes on its own.
 
 const nativeSetInterval = globalThis.setInterval;
 const nativeSetTimeout = globalThis.setTimeout;
@@ -55,7 +48,8 @@ await import('./server.mjs');
 console.log(JSON.stringify({
   event: 'storage-router-mode',
   mode: 'serverless-request-driven',
-  automaticProvisionPolling: false,
+  fixedNodePool: true,
+  automaticProvisioning: false,
   periodicStorageMonitor: false,
   backgroundSelfTest: false,
 }));
