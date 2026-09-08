@@ -1,133 +1,127 @@
 # Immich Railway Multi-Volume Storage Fork
 
-<p align="center">
-  <a href="README.md">简体中文</a> · <strong>English</strong>
-</p>
+<p align="center"><a href="README.md">简体中文</a> · <strong>English</strong></p>
 
-This repository is a downstream fork of [immich-app/immich](https://github.com/immich-app/immich), customized for Railway with HTTP-backed multi-volume media storage, automatic expansion, aggregate capacity reporting, health monitoring, and capacity alerts.
+This repository is a downstream fork of [immich-app/immich](https://github.com/immich-app/immich), customized for Railway with HTTP-backed multi-volume media storage, aggregate capacity reporting, remote-media compatibility, and an All-in-One deployment.
 
 > [!IMPORTANT]
-> Standard Immich features and user documentation remain upstream. This fork primarily adds the Railway storage architecture described below.
+> Production has moved from automatic expansion to a **fixed pool of nine Photo Storage nodes**. The code that automatically created Railway services/volumes has been removed; future expansion is manual.
 
-## What is different from upstream?
-
-| Feature | Upstream Immich | This fork |
-|---|---|---|
-| Photo/video management | Full Immich feature set | Preserved |
-| Original media storage | Local/filesystem | **HTTP multi-volume pool** |
-| Multiple Railway volumes | Manual integration | **Storage Router + Photo Storage nodes** |
-| Capacity shown in Immich | Local storage | **Aggregate remote pool capacity** |
-| New-file placement | N/A | **Healthiest node with the most free space** |
-| Upload failover | N/A | **Retry another eligible node** |
-| Storage monitoring | External | **Per-volume health and usage** |
-| Capacity alerts | External | **Resend email alerts** |
-| Expansion | Manual | **Automatic `Photo Storage N` provisioning** |
-| Default max nodes | Deployment-dependent | **10** |
-
-## Architecture
+## Current production architecture
 
 ```mermaid
 flowchart LR
-    A[Immich Web / Mobile] --> B[Immich Server]
-    B -->|logical media path| C[Storage Router]
-    B --> D[(Immich /data)]
-    C -->|HTTP| S1[Photo Storage 1]
-    C -->|HTTP| S2[Photo Storage 2]
-    C -->|HTTP| S3[Photo Storage 3]
-    C -.->|automatic expansion| SN[Photo Storage N]
-    S1 --> V1[(Volume 1)]
-    S2 --> V2[(Volume 2)]
-    S3 --> V3[(Volume 3)]
-    SN --> VN[(Volume N)]
-    D --> D1[thumbnails / previews]
-    D --> D2[encoded video]
-    D --> D3[profiles / backups / app data]
+    U[Immich Web / Mobile] --> I[Immich AIO]
+    I --> D[(Immich /data)]
+    I --> R[Storage Router - Serverless]
+    R --> S1[Photo Storage 1 - Serverless]
+    R --> S2[Photo Storage 2 - Serverless]
+    R --> SX[...]
+    R --> S9[Photo Storage 9 - Serverless]
 ```
 
-Original photo/video media is stored through Storage Router. Immich's own `/data` volume remains required for application-managed and derived data.
+Immich AIO runs Immich, PostgreSQL 14, and Redis in one service, so it remains always-on. Storage Router and Photo Storage 1–9 run in Railway Serverless mode.
 
-## Automatic expansion
+## Main differences from upstream
 
-All healthy storage nodes reaching **82%** triggers proactive provisioning of the next storage node. **85%** remains the warning threshold and **95%** the critical threshold. Expansion checks run every **60 seconds**; after a provisioning failure, retry happens after **15 seconds**.
+| Feature | Upstream Immich | This fork |
+|---|---|---|
+| Standard photo/video features | ✅ | ✅ Preserved |
+| Original media storage | Local filesystem | **HTTP multi-volume pool** |
+| Multiple Railway volumes | Custom integration required | **Storage Router + Photo Storage 1–9** |
+| Capacity shown in Immich | Local filesystem capacity | **Aggregate remote-pool capacity** |
+| New-file placement | N/A | **Healthy node with the most free space** |
+| Upload failover | N/A | **Temporary spool + failover** |
+| Media processing | Local filesystem paths | **Remote-original staging supported** |
+| Database/Redis | Commonly separate services | **Embedded PostgreSQL + Redis in AIO** |
+| Expansion | Deployment-specific | **Manual in current production** |
 
-Key defaults:
-
-- Provision trigger: `82%`
-- Warning: `85%`
-- Critical: `95%`
-- Expansion check: `60 seconds`
-- Provision retry: `15 seconds`
-- Max storage nodes: `10`
-- Production branch fallback: `3.1.0-remote`
-- Photo Storage root directory: `/photo-storage`
-- Volume mount path: `/photos_extern`
-
-## Components
+## Current fork-specific components
 
 ```text
 immich/
-├── server/
+├── all-in-one/
+│   ├── Dockerfile
+│   ├── entrypoint.sh
+│   ├── supervisord.conf
+│   ├── patch-remote-media-input.mjs
+│   └── patch-web-thumbnail-cache.mjs
 ├── storage-router/
 │   ├── server.mjs
-│   ├── bootstrap.mjs
-│   ├── provisioner.mjs
+│   ├── serverless-bootstrap.mjs
 │   ├── selftest.mjs
-│   ├── README.md
-│   └── README.en.md
+│   └── test-multi-volume.mjs
 ├── photo-storage/
-├── .github/workflows/storage-router-test.yml
-├── RAILWAY_REMOTE_STORAGE.md
-└── RAILWAY_REMOTE_STORAGE.en.md
+│   └── server.mjs
+├── RAILWAY_REMOTE_STORAGE.en.md
+└── README.md
 ```
 
-## Configuration overview
-
-### Immich Server
+Retired historical components:
 
 ```text
-IMMICH_MEDIA_LOCATION=/remote/photo-extern
-REMOTE_STORAGE_URL=http://storage-router.railway.internal:8080
-REMOTE_STORAGE_TOKEN=<shared secret>
+storage-router/bootstrap.mjs
+storage-router/provisioner.mjs
+storage-router/maintenance-bootstrap.mjs
+all-in-one/audit-thumbnails.mjs
 ```
 
-### Storage Router
+## Storage behavior
 
-Important variables include:
+For new uploads, Router queries real free space across the fixed node pool and chooses the healthy node with the most available capacity. It streams to that node while keeping an ephemeral `/tmp` spool; the spool is replayed only when the primary upload fails.
+
+Existing files do not require a separate routing database. Router probes Photo Storage 1–9 by logical path and routes GET/HEAD/DELETE/MOVE to the node that actually owns the file.
+
+## Aggregate capacity
+
+Immich's storage API reads aggregate capacity from Storage Router, so web/mobile clients display the logical Photo Storage pool instead of only the roughly 5 GB local `/data` volume.
+
+## Thumbnails and remote media
+
+This fork supports:
+
+- fallback to Storage Router when a historical `/data/...` file no longer exists locally;
+- temporary staging of remote originals for Sharp/FFmpeg/ExifTool jobs that require a local path;
+- cleanup of staged files after processing;
+- a fixed thumbnail cache version in the web build to avoid reusing historical failed thumbnail responses.
+
+## Expected Railway production services
+
+Production should contain only:
 
 ```text
-STORAGE_NODES
-REMOTE_STORAGE_TOKEN
-STORAGE_PROVISION_TRIGGER_PERCENT
-STORAGE_WARNING_PERCENT
-STORAGE_CRITICAL_PERCENT
-STORAGE_AUTO_PROVISION
-STORAGE_MAX_VOLUMES
-RAILWAY_PROJECT_TOKEN or RAILWAY_API_TOKEN
-RESEND_API_KEY
-ALERT_EMAIL_TO
-ALERT_EMAIL_FROM
+Immich
+Storage Router
+Photo Storage 1
+Photo Storage 2
+...
+Photo Storage 9
 ```
 
-See [Storage Router documentation](storage-router/README.en.md) for the complete reference.
+Separate PostgreSQL, Redis, Machine Learning, temporary AIO validation, and migration-only services are no longer required.
 
-## Reliability and data safety
+## Manual expansion
 
-Uploads are streamed to the selected Photo Storage node while being spooled to ephemeral local storage so the router can replay the request to another eligible node if the primary upload fails. Client-aborted uploads clean up the temporary spool.
+If additional capacity is needed, create `Photo Storage N` manually, mount one volume at `/photos_extern`, configure the same token, then add the node to Router `STORAGE_NODES`. See the [Storage Router documentation](storage-router/README.en.md) for the exact procedure.
 
-Cross-volume MOVE copies first and deletes the source only after the destination write succeeds. The router also uses a 64 MiB allocation safety margin, real `statfs` capacity, health checks, deployment polling, and lifecycle self-tests.
+## Data safety
 
 > [!WARNING]
-> The multi-volume architecture is **not a backup strategy**. Keep independent backups of important photos and videos.
+> This multi-volume architecture is not a backup strategy. Keep independent backups of important media.
+
+Do not delete the production Immich `/data` volume. It now contains the production PostgreSQL database, Redis persistence, and Immich-derived media.
 
 ## Upgrade strategy
 
-This fork tracks upstream **stable releases** using versioned `*-remote` branches rather than deploying upstream `main` directly. Validate database migrations, upload/read/delete/MOVE, thumbnails, transcoding, metadata extraction, aggregate capacity, and multi-volume routing before switching production.
+Continue tracking upstream stable releases with versioned `*-remote` branches. Do not point production directly at upstream `main`. Before switching production, validate database migrations, upload/read/delete/MOVE, thumbnails, video processing, remote staging, aggregate capacity, and all storage nodes.
 
-Current production baseline: **Immich v3.1.0**, branch **`3.1.0-remote`**.
+Current production baseline: **Immich v3.1.0 / `3.1.0-remote`**.
 
 ## Documentation
 
-- [中文 README（默认）](README.md)
-- [Railway remote storage — English](RAILWAY_REMOTE_STORAGE.en.md)
-- [Storage Router — English](storage-router/README.en.md)
+- [Railway production architecture and operations](RAILWAY_REMOTE_STORAGE.en.md)
+- [Storage Router](storage-router/README.en.md)
+- [Immich AIO](all-in-one/README.en.md)
 - [Official Immich documentation](https://docs.immich.app/)
+
+This repository continues to follow the upstream **AGPL-3.0** license.
