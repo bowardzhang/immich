@@ -1,6 +1,6 @@
 # Railway Immich All-in-One image
 # Combines the custom Immich server build with PostgreSQL 14 + VectorChord,
-# Redis-compatible Valkey and optional Machine Learning in one Railway service.
+# Redis-compatible storage and optional Machine Learning in one Railway service.
 
 FROM ghcr.io/immich-app/base-server-dev:202607211135@sha256:83c9ff3f7390111596a2dcd24a746c3f8618d58259dbc7aae36618d153462f18 AS builder
 ENV COREPACK_ENABLE_DOWNLOAD_PROMPT=0 CI=1 COREPACK_HOME=/tmp PNPM_HOME=/buildcache/pnpm-store PATH="/buildcache/pnpm-store:$PATH"
@@ -46,20 +46,20 @@ COPY ./packages/plugin-core ./packages/plugin-core/
 COPY ./packages/plugin-sdk ./packages/plugin-sdk/
 RUN mise //:plugins
 
-# Keep the exact production runtime used by this fork, then add the local stateful services.
 FROM ghcr.io/immich-app/base-server-prod:202607211135@sha256:ced131da7523544fe975cfd25abd67386e712e39496340b437cd95a08d0a18f3 AS runtime
-ARG TARGETARCH
 ENV DEBIAN_FRONTEND=noninteractive
 
-# PostgreSQL 14 and Redis. VectorChord/pgvecto.rs are installed below to match the
-# existing Immich database image (14-vectorchord0.4.3-pgvectors0.2.0).
+# Install basic runtime tools first, without Debian's postgresql-common. Then add PGDG
+# and resolve all PostgreSQL packages from the same repository generation. HTTP is
+# acceptable here because apt verifies the repository metadata with the pinned PGDG key.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      ca-certificates curl wget gnupg postgresql-common redis-server supervisor && \
+      ca-certificates curl wget gnupg redis-server supervisor && \
     mkdir -p /usr/share/postgresql-common/pgdg && \
     curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc && \
     . /etc/os-release && \
-    echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt ${VERSION_CODENAME}-pgdg main" > /etc/apt/sources.list.d/pgdg.list && \
-    apt-get update && apt-get install -y --no-install-recommends postgresql-14 postgresql-client-14 && \
+    echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] http://apt.postgresql.org/pub/repos/apt ${VERSION_CODENAME}-pgdg main" > /etc/apt/sources.list.d/pgdg.list && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends postgresql-common postgresql-client-common postgresql-14 postgresql-client-14 && \
     ARCH="$(dpkg --print-architecture)" && \
     wget -q -O /tmp/vchord.deb "https://github.com/tensorchord/VectorChord/releases/download/0.4.3/postgresql-14-vchord_0.4.3-1_${ARCH}.deb" && \
     wget -q -O /tmp/pgvectors.deb "https://github.com/tensorchord/pgvecto.rs/releases/download/v0.2.0/vectors-pg14_0.2.0_${ARCH}.deb" && \
