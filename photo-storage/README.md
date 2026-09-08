@@ -29,3 +29,5 @@ Each Railway service can have only one Volume, so future volumes are represented
 `GET /api/file` supports HTTP Range requests, useful for video playback.
 
 The service rejects paths escaping the configured storage root and requires the Bearer token when `REMOTE_STORAGE_TOKEN` is configured.
+
+Operational note: Photo Storage services may be kept always-on while validating or repairing cross-volume reads. Once Router lookups are optimized for parallel cold-start probing, Railway Serverless mode can be re-enabled without changing the storage format.
