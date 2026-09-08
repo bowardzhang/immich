@@ -12,6 +12,11 @@ const MAX_UPLOAD_SPOOL_BYTES = Number(process.env.STORAGE_MAX_UPLOAD_SPOOL_BYTES
 const NODE_REQUEST_TIMEOUT_MS = Number(process.env.STORAGE_NODE_REQUEST_TIMEOUT_MS || 12_000);
 const NODE_COLD_RETRY_DELAY_MS = Number(process.env.STORAGE_NODE_COLD_RETRY_DELAY_MS || 1_500);
 const DEFAULT_NODE_CAPACITY_BYTES = Number(process.env.STORAGE_NODE_CAPACITY_BYTES || 4_838_498_304);
+const INDEX_URL = String(process.env.STORAGE_INDEX_URL || '').replace(/\/$/, '');
+const INDEX_TOKEN = process.env.STORAGE_INDEX_TOKEN || TOKEN;
+const INDEX_TIMEOUT_MS = Number(process.env.STORAGE_INDEX_TIMEOUT_MS || 2_000);
+const INDEX_REBUILD_ON_START = String(process.env.STORAGE_INDEX_REBUILD_ON_START || '').toLowerCase() === 'true';
+const INDEX_REBUILD_BATCH_SIZE = Number(process.env.STORAGE_INDEX_REBUILD_BATCH_SIZE || 500);
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -34,6 +39,7 @@ function parseNodes() {
 }
 
 const nodes = parseNodes();
+const nodesByName = new Map(nodes.map((node) => [node.name, node]));
 const pathCache = new Map();
 
 function headers(node, extra = {}) {
@@ -67,6 +73,87 @@ async function nodeFetch(node, pathname, init = {}, retries = 0) {
   throw new Error(`${node.name} upstream request failed (${target}): ${details || String(lastError)}`);
 }
 
+async function indexFetch(pathname, init = {}) {
+  if (!INDEX_URL) return null;
+  return fetch(`${INDEX_URL}${pathname}`, {
+    ...init,
+    headers: {
+      ...(INDEX_TOKEN ? { authorization: `Bearer ${INDEX_TOKEN}` } : {}),
+      ...(init.body ? { 'content-type': 'application/json' } : {}),
+      ...(init.headers || {}),
+    },
+    signal: init.signal || AbortSignal.timeout(INDEX_TIMEOUT_MS),
+  });
+}
+
+async function indexLookup(relative) {
+  if (!INDEX_URL) return null;
+  try {
+    const response = await indexFetch(`/lookup?path=${encodeURIComponent(relative)}`);
+    if (!response || response.status === 404) return null;
+    if (!response.ok) throw new Error(`index lookup returned ${response.status}`);
+    const data = await response.json();
+    const node = nodesByName.get(data.node);
+    if (!node) {
+      await indexDelete(relative);
+      return null;
+    }
+    return { node, path: String(data.path || relative) };
+  } catch (error) {
+    console.warn(JSON.stringify({ event: 'storage-index-unavailable', operation: 'lookup', path: relative, error: error instanceof Error ? error.message : String(error) }));
+    return null;
+  }
+}
+
+async function indexUpsert(relative, node, resolvedPath = relative) {
+  if (!INDEX_URL) return;
+  try {
+    const response = await indexFetch('/upsert', {
+      method: 'POST',
+      body: JSON.stringify({ path: relative, node: node.name, resolvedPath }),
+    });
+    if (!response?.ok) throw new Error(`index upsert returned ${response?.status}`);
+  } catch (error) {
+    console.warn(JSON.stringify({ event: 'storage-index-unavailable', operation: 'upsert', path: relative, node: node.name, error: error instanceof Error ? error.message : String(error) }));
+  }
+}
+
+async function indexDelete(relative) {
+  if (!INDEX_URL) return;
+  try {
+    const response = await indexFetch('/delete', { method: 'POST', body: JSON.stringify({ path: relative }) });
+    if (!response?.ok) throw new Error(`index delete returned ${response?.status}`);
+  } catch (error) {
+    console.warn(JSON.stringify({ event: 'storage-index-unavailable', operation: 'delete', path: relative, error: error instanceof Error ? error.message : String(error) }));
+  }
+}
+
+async function indexMove(source, relative, node, resolvedPath = relative) {
+  if (!INDEX_URL) return;
+  try {
+    const response = await indexFetch('/move', {
+      method: 'POST',
+      body: JSON.stringify({ source, path: relative, node: node.name, resolvedPath }),
+    });
+    if (!response?.ok) throw new Error(`index move returned ${response?.status}`);
+  } catch (error) {
+    console.warn(JSON.stringify({ event: 'storage-index-unavailable', operation: 'move', source, path: relative, node: node.name, error: error instanceof Error ? error.message : String(error) }));
+  }
+}
+
+async function indexBulkUpsert(entries) {
+  if (!INDEX_URL || entries.length === 0) return 0;
+  let accepted = 0;
+  for (let i = 0; i < entries.length; i += INDEX_REBUILD_BATCH_SIZE) {
+    const batch = entries.slice(i, i + INDEX_REBUILD_BATCH_SIZE);
+    const response = await indexFetch('/bulk-upsert', { method: 'POST', body: JSON.stringify({ entries: batch }) });
+    if (!response?.ok) throw new Error(`index bulk-upsert returned ${response?.status}`);
+    const data = await response.json();
+    accepted += Number(data.accepted || 0);
+  }
+  return accepted;
+}
+
 async function headOnNode(node, relative) {
   const response = await nodeFetch(node, `/api/file?path=${encodeURIComponent(relative)}`, { method: 'HEAD' }, 1);
   return response.ok ? response : null;
@@ -82,6 +169,18 @@ async function findExactFile(relative) {
     pathCache.delete(relative);
   }
 
+  const indexed = await indexLookup(relative);
+  if (indexed) {
+    try {
+      const response = await headOnNode(indexed.node, indexed.path);
+      if (response) {
+        pathCache.set(relative, indexed);
+        return { node: indexed.node, response, path: indexed.path, via: 'persistent-index' };
+      }
+    } catch {}
+    await indexDelete(relative);
+  }
+
   const results = await Promise.allSettled(nodes.map(async (node) => {
     const response = await headOnNode(node, relative);
     return response ? { node, response, path: relative, via: 'exact' } : null;
@@ -90,6 +189,7 @@ async function findExactFile(relative) {
   for (const result of results) {
     if (result.status === 'fulfilled' && result.value) {
       pathCache.set(relative, { node: result.value.node, path: relative });
+      await indexUpsert(relative, result.value.node, relative);
       return result.value;
     }
   }
@@ -111,13 +211,7 @@ async function findUniqueBasename(relative) {
 
   const matches = results.flatMap((result) => result.status === 'fulfilled' ? result.value : []);
   if (matches.length !== 1) {
-    console.warn(JSON.stringify({
-      event: 'storage-basename-fallback',
-      requestedPath: relative,
-      basename: name,
-      matches: matches.length,
-      result: matches.length === 0 ? 'not-found' : 'ambiguous',
-    }));
+    console.warn(JSON.stringify({ event: 'storage-basename-fallback', requestedPath: relative, basename: name, matches: matches.length, result: matches.length === 0 ? 'not-found' : 'ambiguous' }));
     return null;
   }
 
@@ -125,13 +219,9 @@ async function findUniqueBasename(relative) {
   const response = await headOnNode(match.node, match.path);
   if (!response) return null;
   pathCache.set(relative, { node: match.node, path: match.path });
-  console.warn(JSON.stringify({
-    event: 'storage-basename-fallback',
-    requestedPath: relative,
-    resolvedPath: match.path,
-    node: match.node.name,
-    result: 'unique-match',
-  }));
+  await indexUpsert(relative, match.node, match.path);
+  await indexUpsert(match.path, match.node, match.path);
+  console.warn(JSON.stringify({ event: 'storage-basename-fallback', requestedPath: relative, resolvedPath: match.path, node: match.node.name, result: 'unique-match' }));
   return { node: match.node, response, path: match.path, via: 'basename' };
 }
 
@@ -147,45 +237,21 @@ async function getStatus(node) {
     const capacityBytes = Number(data.totalBytes || node.configuredCapacityBytes || DEFAULT_NODE_CAPACITY_BYTES);
     const availableBytes = Number(data.availableBytes || data.freeBytes || 0);
     const usedBytes = Math.max(0, capacityBytes - availableBytes);
-    const storage = {
-      name: node.name,
-      url: node.url,
-      healthy: true,
-      stale: false,
-      lastError: null,
-      lastCheckedAt: node.lastCheckedAt,
-      usedBytes,
-      availableBytes,
-      capacityBytes,
-      usagePercent: capacityBytes > 0 ? (usedBytes / capacityBytes) * 100 : 100,
-    };
+    const storage = { name: node.name, url: node.url, healthy: true, stale: false, lastError: null, lastCheckedAt: node.lastCheckedAt, usedBytes, availableBytes, capacityBytes, usagePercent: capacityBytes > 0 ? (usedBytes / capacityBytes) * 100 : 100 };
     node.lastStorage = storage;
     return storage;
   } catch (error) {
     const capacityBytes = node.lastStorage?.capacityBytes || node.configuredCapacityBytes || DEFAULT_NODE_CAPACITY_BYTES;
     const availableBytes = node.lastStorage?.availableBytes || 0;
     const usedBytes = Math.max(0, capacityBytes - availableBytes);
-    return {
-      name: node.name,
-      url: node.url,
-      healthy: false,
-      stale: true,
-      lastError: error instanceof Error ? error.message : String(error),
-      lastCheckedAt: node.lastCheckedAt,
-      usedBytes,
-      availableBytes,
-      capacityBytes,
-      usagePercent: capacityBytes > 0 ? (usedBytes / capacityBytes) * 100 : 100,
-    };
+    return { name: node.name, url: node.url, healthy: false, stale: true, lastError: error instanceof Error ? error.message : String(error), lastCheckedAt: node.lastCheckedAt, usedBytes, availableBytes, capacityBytes, usagePercent: capacityBytes > 0 ? (usedBytes / capacityBytes) * 100 : 100 };
   }
 }
 
 async function candidateNodes(requiredBytes = 0, exclude = new Set()) {
   const statuses = await Promise.all(nodes.map(async (node) => ({ node, status: await getStatus(node) })));
   const required = Math.max(0, requiredBytes) + ALLOCATION_SAFETY_BYTES;
-  return statuses
-    .filter(({ node, status }) => !exclude.has(node) && status.healthy && status.availableBytes >= required)
-    .sort((a, b) => b.status.availableBytes - a.status.availableBytes);
+  return statuses.filter(({ node, status }) => !exclude.has(node) && status.healthy && status.availableBytes >= required).sort((a, b) => b.status.availableBytes - a.status.availableBytes);
 }
 
 async function putWithFailover(relative, spoolFile, headersIn, requiredBytes = 0, exclude = new Set()) {
@@ -195,11 +261,10 @@ async function putWithFailover(relative, spoolFile, headersIn, requiredBytes = 0
   for (const { node } of candidates) {
     try {
       const body = createReadStream(spoolFile);
-      const upstream = await nodeFetch(node, `/api/file?path=${encodeURIComponent(relative)}`, {
-        method: 'PUT', body, duplex: 'half', headers: headersIn,
-      });
+      const upstream = await nodeFetch(node, `/api/file?path=${encodeURIComponent(relative)}`, { method: 'PUT', body, duplex: 'half', headers: headersIn });
       if (upstream.ok || upstream.status < 500) {
         pathCache.set(relative, { node, path: relative });
+        await indexUpsert(relative, node, relative);
         return { node, upstream };
       }
       lastError = new Error(`${node.name}: upstream returned ${upstream.status} ${upstream.statusText}`);
@@ -221,14 +286,8 @@ async function streamPutWithSpoolFailover(relative, req, contentLength = 0) {
   const spool = createWriteStream(file);
   const upstreamBody = new PassThrough();
   const contentType = req.headers['content-type'] || 'application/octet-stream';
-  const primaryHeaders = {
-    'content-type': contentType,
-    ...(contentLength > 0 ? { 'content-length': String(contentLength) } : {}),
-  };
-
-  const primaryPromise = nodeFetch(primary, `/api/file?path=${encodeURIComponent(relative)}`, {
-    method: 'PUT', body: upstreamBody, duplex: 'half', headers: primaryHeaders,
-  }).then((upstream) => ({ upstream, error: null })).catch((error) => ({ upstream: null, error }));
+  const primaryHeaders = { 'content-type': contentType, ...(contentLength > 0 ? { 'content-length': String(contentLength) } : {}) };
+  const primaryPromise = nodeFetch(primary, `/api/file?path=${encodeURIComponent(relative)}`, { method: 'PUT', body: upstreamBody, duplex: 'half', headers: primaryHeaders }).then((upstream) => ({ upstream, error: null })).catch((error) => ({ upstream: null, error }));
 
   try {
     req.pipe(spool);
@@ -252,13 +311,11 @@ async function streamPutWithSpoolFailover(relative, req, contentLength = 0) {
     const primaryResult = await primaryPromise;
     if (primaryResult.upstream && (primaryResult.upstream.ok || primaryResult.upstream.status < 500)) {
       pathCache.set(relative, { node: primary, path: relative });
+      await indexUpsert(relative, primary, relative);
       return { node: primary, upstream: primaryResult.upstream, dir };
     }
 
-    const { node, upstream } = await putWithFailover(relative, file, {
-      'content-type': contentType,
-      'content-length': String(actualBytes),
-    }, actualBytes, new Set([primary]));
+    const { node, upstream } = await putWithFailover(relative, file, { 'content-type': contentType, 'content-length': String(actualBytes) }, actualBytes, new Set([primary]));
     return { node, upstream, dir };
   } catch (error) {
     req.unpipe(spool);
@@ -268,6 +325,43 @@ async function streamPutWithSpoolFailover(relative, req, contentLength = 0) {
     await rm(dir, { recursive: true, force: true }).catch(() => {});
     throw error;
   }
+}
+
+async function rebuildPersistentIndex() {
+  if (!INDEX_URL) throw new Error('STORAGE_INDEX_URL is not configured');
+  const results = await Promise.allSettled(nodes.map(async (node) => {
+    const response = await nodeFetch(node, '/api/list?path=&recursive=true', {}, 1);
+    if (!response.ok) throw new Error(`${node.name}: list returned ${response.status}`);
+    const data = await response.json();
+    return { node, files: (data.entries || []).filter((entry) => entry?.type === 'file').map((entry) => String(entry.path || '')).filter(Boolean) };
+  }));
+
+  const candidates = new Map();
+  const failedNodes = [];
+  for (const result of results) {
+    if (result.status !== 'fulfilled') {
+      failedNodes.push(result.reason instanceof Error ? result.reason.message : String(result.reason));
+      continue;
+    }
+    for (const path of result.value.files) {
+      const list = candidates.get(path) || [];
+      list.push(result.value.node);
+      candidates.set(path, list);
+    }
+  }
+
+  const unique = [];
+  let duplicatePaths = 0;
+  for (const [path, owners] of candidates) {
+    if (owners.length !== 1) {
+      duplicatePaths++;
+      continue;
+    }
+    unique.push({ path, node: owners[0].name, resolvedPath: path });
+  }
+  const accepted = await indexBulkUpsert(unique);
+  console.log(JSON.stringify({ event: 'storage-index-rebuild-complete', uniquePaths: unique.length, accepted, duplicatePaths, failedNodes }));
+  return { uniquePaths: unique.length, accepted, duplicatePaths, failedNodes };
 }
 
 function json(res, status, body) {
@@ -300,34 +394,30 @@ const server = http.createServer(async (req, res) => {
     const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
     const relative = url.searchParams.get('path') || '';
 
-    if (req.method === 'GET' && url.pathname === '/health') {
-      return json(res, 200, { ok: true, nodes: nodes.length, fixedNodePool: true });
-    }
+    if (req.method === 'GET' && url.pathname === '/health') return json(res, 200, { ok: true, nodes: nodes.length, fixedNodePool: true, persistentIndex: Boolean(INDEX_URL) });
     if (TOKEN && req.headers.authorization !== `Bearer ${TOKEN}`) return json(res, 401, { error: 'Unauthorized' });
 
     if (req.method === 'GET' && url.pathname === '/api/storage') {
       const statuses = await poolStatus();
-      return json(res, 200, {
-        totalBytes: statuses.reduce((sum, item) => sum + item.capacityBytes, 0),
-        availableBytes: statuses.reduce((sum, item) => sum + item.availableBytes, 0),
-        freeBytes: statuses.reduce((sum, item) => sum + item.availableBytes, 0),
-        volumes: statuses,
-      });
+      return json(res, 200, { totalBytes: statuses.reduce((sum, item) => sum + item.capacityBytes, 0), availableBytes: statuses.reduce((sum, item) => sum + item.availableBytes, 0), freeBytes: statuses.reduce((sum, item) => sum + item.availableBytes, 0), volumes: statuses });
     }
 
     if (req.method === 'GET' && url.pathname === '/api/storage/status') {
       const statuses = await poolStatus();
-      return json(res, 200, { volumes: statuses, maxVolumes: nodes.length, fixedNodePool: true });
+      return json(res, 200, { volumes: statuses, maxVolumes: nodes.length, fixedNodePool: true, persistentIndex: Boolean(INDEX_URL) });
+    }
+
+    if (req.method === 'POST' && url.pathname === '/api/index/rebuild') {
+      return json(res, 200, await rebuildPersistentIndex());
     }
 
     if ((req.method === 'GET' || req.method === 'HEAD') && url.pathname === '/api/file') {
       const found = await findReadableFile(relative);
       if (!found) return json(res, 404, { error: 'File not found' });
-      const upstream = await nodeFetch(found.node, `/api/file?path=${encodeURIComponent(found.path)}`, {
-        method: req.method,
-        headers: req.headers.range ? { range: req.headers.range } : {},
-      }, 1);
-      if (found.via === 'basename') upstream.headers.set('x-storage-resolved-path', found.path);
+      const upstream = await nodeFetch(found.node, `/api/file?path=${encodeURIComponent(found.path)}`, { method: req.method, headers: req.headers.range ? { range: req.headers.range } : {} }, 1);
+      if (found.via === 'basename' || found.path !== relative) upstream.headers.set('x-storage-resolved-path', found.path);
+      upstream.headers.set('x-storage-route', found.via);
+      upstream.headers.set('x-storage-node', found.node.name);
       return proxyResponse(res, upstream);
     }
 
@@ -345,8 +435,12 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'DELETE' && url.pathname === '/api/file') {
       const found = await findExactFile(relative);
       if (!found) return json(res, 404, { error: 'File not found' });
-      const upstream = await nodeFetch(found.node, `/api/file?path=${encodeURIComponent(relative)}`, { method: 'DELETE' });
-      if (upstream.ok) pathCache.delete(relative);
+      const upstream = await nodeFetch(found.node, `/api/file?path=${encodeURIComponent(found.path)}`, { method: 'DELETE' });
+      if (upstream.ok) {
+        pathCache.delete(relative);
+        await indexDelete(relative);
+        if (found.path !== relative) await indexDelete(found.path);
+      }
       return proxyResponse(res, upstream);
     }
 
@@ -354,14 +448,14 @@ const server = http.createServer(async (req, res) => {
       const source = url.searchParams.get('source') || '';
       const found = await findExactFile(source);
       if (!found) return json(res, 404, { error: 'Source file not found' });
-
       const sourceSize = Number(found.response.headers.get('content-length') || 0);
       const candidates = await candidateNodes(Number.isFinite(sourceSize) ? sourceSize : 0, new Set([found.node]));
       if (candidates.length === 0) {
-        const upstream = await nodeFetch(found.node, `/api/file?path=${encodeURIComponent(relative)}&source=${encodeURIComponent(source)}`, { method: 'MOVE' });
+        const upstream = await nodeFetch(found.node, `/api/file?path=${encodeURIComponent(relative)}&source=${encodeURIComponent(found.path)}`, { method: 'MOVE' });
         if (upstream.ok) {
           pathCache.delete(source);
           pathCache.set(relative, { node: found.node, path: relative });
+          await indexMove(source, relative, found.node, relative);
         }
         return proxyResponse(res, upstream);
       }
@@ -369,22 +463,15 @@ const server = http.createServer(async (req, res) => {
       let lastError;
       for (const { node: targetNode } of candidates) {
         try {
-          const sourceResponse = await nodeFetch(found.node, `/api/file?path=${encodeURIComponent(source)}`);
+          const sourceResponse = await nodeFetch(found.node, `/api/file?path=${encodeURIComponent(found.path)}`);
           if (!sourceResponse.ok || !sourceResponse.body) throw new Error(`Unable to read source: ${sourceResponse.status}`);
-          const uploadResponse = await nodeFetch(targetNode, `/api/file?path=${encodeURIComponent(relative)}`, {
-            method: 'PUT',
-            body: sourceResponse.body,
-            duplex: 'half',
-            headers: {
-              'content-type': sourceResponse.headers.get('content-type') || 'application/octet-stream',
-              ...(sourceResponse.headers.get('content-length') ? { 'content-length': sourceResponse.headers.get('content-length') } : {}),
-            },
-          });
+          const uploadResponse = await nodeFetch(targetNode, `/api/file?path=${encodeURIComponent(relative)}`, { method: 'PUT', body: sourceResponse.body, duplex: 'half', headers: { 'content-type': sourceResponse.headers.get('content-type') || 'application/octet-stream', ...(sourceResponse.headers.get('content-length') ? { 'content-length': sourceResponse.headers.get('content-length') } : {}) } });
           if (!uploadResponse.ok) throw new Error(`${targetNode.name}: target write ${uploadResponse.status}`);
-          const deleteResponse = await nodeFetch(found.node, `/api/file?path=${encodeURIComponent(source)}`, { method: 'DELETE' });
+          const deleteResponse = await nodeFetch(found.node, `/api/file?path=${encodeURIComponent(found.path)}`, { method: 'DELETE' });
           if (!deleteResponse.ok) throw new Error(`source deletion failed: ${deleteResponse.status}`);
           pathCache.delete(source);
           pathCache.set(relative, { node: targetNode, path: relative });
+          await indexMove(source, relative, targetNode, relative);
           return json(res, 200, { source, path: relative, node: targetNode.name });
         } catch (error) {
           lastError = error;
@@ -418,14 +505,9 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, '0.0.0.0', () => {
-  console.log(JSON.stringify({
-    event: 'storage-router-mode',
-    mode: 'serverless-request-driven',
-    fixedNodePool: true,
-    nodes: nodes.length,
-    automaticProvisioning: false,
-    capacityFallbackBytesPerNode: DEFAULT_NODE_CAPACITY_BYTES,
-    basenameReadFallback: 'unique-match-only',
-  }));
+  console.log(JSON.stringify({ event: 'storage-router-mode', mode: 'serverless-request-driven', fixedNodePool: true, nodes: nodes.length, automaticProvisioning: false, capacityFallbackBytesPerNode: DEFAULT_NODE_CAPACITY_BYTES, basenameReadFallback: 'unique-match-only', persistentIndex: Boolean(INDEX_URL), indexUrl: INDEX_URL || null }));
   console.log(`Storage router listening on ${PORT}`);
+  if (INDEX_REBUILD_ON_START) {
+    rebuildPersistentIndex().catch((error) => console.error(JSON.stringify({ event: 'storage-index-rebuild-error', error: error instanceof Error ? error.message : String(error) })));
+  }
 });
