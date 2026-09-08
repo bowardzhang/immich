@@ -12,7 +12,9 @@ COPY package.json .pnpmfile.cjs pnpm-lock.yaml pnpm-workspace.yaml ./
 COPY ./server ./server/
 COPY ./packages/sdk ./packages/sdk/
 COPY ./packages/plugin-sdk ./packages/plugin-sdk/
-RUN SHARP_IGNORE_GLOBAL_LIBVIPS=true pnpm --filter @immich/sdk --filter @immich/plugin-sdk --filter immich build && \
+COPY ./all-in-one/patch-remote-media-input.mjs ./all-in-one/patch-remote-media-input.mjs
+RUN node ./all-in-one/patch-remote-media-input.mjs && \
+    SHARP_IGNORE_GLOBAL_LIBVIPS=true pnpm --filter @immich/sdk --filter @immich/plugin-sdk --filter immich build && \
     SHARP_FORCE_GLOBAL_LIBVIPS=true pnpm --filter immich --prod --no-optional deploy /output/server-pruned
 
 FROM builder AS web-build
