@@ -1,5 +1,6 @@
 // Serverless entry point for Railway.
 // This is also the steady-state mode restored after any one-shot provisioning run.
+// PS9 provisioning completed on 2026-09-08; normal request-driven mode is restored here.
 //
 // The normal server keeps two background timers alive:
 //   1. a periodic pool monitor that calls /api/storage on every Photo Storage node;
@@ -24,8 +25,6 @@ function disabledTimer(kind, delay) {
     delayMs: delay,
   }));
 
-  // server.mjs immediately calls .unref() on both timer handles.  Return a
-  // timer-compatible no-op handle instead of scheduling work.
   return {
     ref() { return this; },
     unref() { return this; },
@@ -51,9 +50,6 @@ globalThis.setTimeout = function serverlessSetTimeout(callback, delay, ...args) 
   return nativeSetTimeout(callback, delay, ...args);
 };
 
-// Import server.mjs directly rather than bootstrap.mjs.  bootstrap.mjs contains
-// automatic provisioning timers that periodically query the whole storage pool;
-// with pre-provisioned volumes that is deliberately disabled in Serverless mode.
 await import('./server.mjs');
 
 console.log(JSON.stringify({
