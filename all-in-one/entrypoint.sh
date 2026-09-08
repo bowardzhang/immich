@@ -26,13 +26,20 @@ chown -R postgres:postgres "$(dirname "$PGDATA")"
 if [ ! -s "$PGDATA/PG_VERSION" ]; then
   log "initializing PostgreSQL 14 cluster"
   install -d -o postgres -g postgres -m 700 "$PGDATA"
+  pwfile="$(mktemp)"
+  trap 'rm -f "$pwfile"' EXIT
+  printf '%s' "$DB_PASSWORD" > "$pwfile"
+  chown postgres:postgres "$pwfile"
+  chmod 600 "$pwfile"
   runuser -u postgres -- /usr/lib/postgresql/14/bin/initdb \
     --pgdata="$PGDATA" \
     --username="$DB_USERNAME" \
-    --pwfile=<(printf '%s' "$DB_PASSWORD") \
+    --pwfile="$pwfile" \
     --data-checksums \
     --auth-host=scram-sha-256 \
     --auth-local=trust
+  rm -f "$pwfile"
+  trap - EXIT
 
   cat >> "$PGDATA/postgresql.conf" <<'PGCONF'
 listen_addresses = '127.0.0.1'
@@ -45,7 +52,6 @@ synchronous_commit = on
 full_page_writes = on
 PGCONF
 
-  # Start only long enough to create the Immich database if it differs from the bootstrap user.
   runuser -u postgres -- /usr/lib/postgresql/14/bin/pg_ctl -D "$PGDATA" -w start
   if ! runuser -u postgres -- /usr/lib/postgresql/14/bin/psql -v ON_ERROR_STOP=1 --username "$DB_USERNAME" --dbname postgres \
       -tAc "SELECT 1 FROM pg_database WHERE datname='${DB_DATABASE_NAME//\'/\'\'}'" | grep -q 1; then
@@ -55,7 +61,6 @@ PGCONF
   runuser -u postgres -- /usr/lib/postgresql/14/bin/pg_ctl -D "$PGDATA" -m fast -w stop
 fi
 
-# Redis/Valkey is deliberately lightweight. Persistence is kept in the same Railway volume.
 cat > /tmp/redis-aio.conf <<EOF
 bind 127.0.0.1
 port ${REDIS_PORT}
