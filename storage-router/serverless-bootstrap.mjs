@@ -1,9 +1,12 @@
 // Railway Serverless entry point for the fixed Photo Storage pool.
 //
 // Keep the Router request-driven so Railway can sleep it when idle.
-// Also apply a narrow runtime compatibility patch before loading server.mjs:
-// undici fetch() Response headers are immutable, so route diagnostics must be
-// merged into the outgoing Node response instead of mutating upstream.headers.
+// Apply narrow runtime compatibility patches before loading server.mjs:
+// 1) undici fetch() Response headers are immutable, so route diagnostics must be
+//    merged into the outgoing Node response instead of mutating upstream.headers.
+// 2) a transient HEAD/network failure on a sleeping indexed Photo Storage node
+//    must not delete a correct persistent index entry. Only an explicit 404 may
+//    invalidate the index; other failures defer validation to the real GET/Range.
 
 import { readFile, writeFile } from 'node:fs/promises';
 
@@ -54,13 +57,20 @@ const newProxy = `async function proxyResponse(res, upstream, extraHeaders = {})
 const oldRoute = `      if (found.via === 'basename' || found.path !== relative) upstream.headers.set('x-storage-resolved-path', found.path);\n      upstream.headers.set('x-storage-route', found.via);\n      upstream.headers.set('x-storage-node', found.node.name);\n      return proxyResponse(res, upstream);`;
 const newRoute = `      const routeHeaders = {\n        'x-storage-route': found.via,\n        'x-storage-node': found.node.name,\n        ...((found.via === 'basename' || found.path !== relative) ? { 'x-storage-resolved-path': found.path } : {}),\n      };\n      return proxyResponse(res, upstream, routeHeaders);`;
 
-if (!source.includes(oldProxy) || !source.includes(oldRoute)) {
-  throw new Error('Storage Router response-header compatibility patch no longer matches server.mjs');
+const oldIndexedProbe = `  const indexed = await indexLookup(relative);\n  if (indexed) {\n    try {\n      const response = await headOnNode(indexed.node, indexed.path);\n      if (response) {\n        pathCache.set(relative, indexed);\n        return { node: indexed.node, response, path: indexed.path, via: 'persistent-index' };\n      }\n    } catch {}\n    await indexDelete(relative);\n  }`;
+const newIndexedProbe = `  const indexed = await indexLookup(relative);\n  if (indexed) {\n    try {\n      const response = await nodeFetch(indexed.node, \`/api/file?path=\${encodeURIComponent(indexed.path)}\`, { method: 'HEAD' }, 1);\n      if (response.ok) {\n        pathCache.set(relative, indexed);\n        return { node: indexed.node, response, path: indexed.path, via: 'persistent-index' };\n      }\n      if (response.status === 404) {\n        await indexDelete(relative);\n      } else {\n        console.warn(JSON.stringify({ event: 'storage-index-probe-deferred', path: relative, node: indexed.node.name, status: response.status }));\n        pathCache.set(relative, indexed);\n        return { node: indexed.node, response, path: indexed.path, via: 'persistent-index-unverified' };\n      }\n    } catch (error) {\n      console.warn(JSON.stringify({ event: 'storage-index-probe-deferred', path: relative, node: indexed.node.name, error: error instanceof Error ? error.message : String(error) }));\n      pathCache.set(relative, indexed);\n      return { node: indexed.node, response: new Response(null, { status: 200 }), path: indexed.path, via: 'persistent-index-unverified' };\n    }\n  }`;
+
+if (!source.includes(oldProxy) || !source.includes(oldRoute) || !source.includes(oldIndexedProbe)) {
+  throw new Error('Storage Router runtime compatibility patch no longer matches server.mjs');
 }
-source = source.replace(oldProxy, newProxy).replace(oldRoute, newRoute);
+source = source
+  .replace(oldProxy, newProxy)
+  .replace(oldRoute, newRoute)
+  .replace(oldIndexedProbe, newIndexedProbe);
 await writeFile(runtimeUrl, source, 'utf8');
 
 console.log(JSON.stringify({ event: 'storage-router-response-header-patch', applied: true }));
+console.log(JSON.stringify({ event: 'storage-router-persistent-index-probe-patch', applied: true, deleteOnlyOnExplicit404: true }));
 await import('./server-runtime.mjs');
 
 console.log(JSON.stringify({
