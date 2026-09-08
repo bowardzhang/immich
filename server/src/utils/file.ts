@@ -47,6 +47,8 @@ const cacheControlHeaders: Record<CacheControl, string | null> = {
   [CacheControl.None]: null,
 };
 
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
 const sendRemoteFile = async (res: Response, path: string): Promise<number> => {
   const baseUrl = (process.env.REMOTE_STORAGE_URL || '').replace(/\/$/, '');
   const token = process.env.REMOTE_STORAGE_TOKEN || '';
@@ -59,7 +61,25 @@ const sendRemoteFile = async (res: Response, path: string): Promise<number> => {
   if (token) headers.authorization = `Bearer ${token}`;
   if (range) headers.range = range;
 
-  const response = await fetch(`${baseUrl}/api/file?path=${encodedPath}`, { headers });
+  const target = `${baseUrl}/api/file?path=${encodedPath}`;
+  const attempts = Number(process.env.REMOTE_STORAGE_FETCH_ATTEMPTS || 4);
+  const retryDelayMs = Number(process.env.REMOTE_STORAGE_FETCH_RETRY_MS || 1000);
+  const timeoutMs = Number(process.env.REMOTE_STORAGE_FETCH_TIMEOUT_MS || 20_000);
+
+  let response: globalThis.Response | undefined;
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= Math.max(1, attempts); attempt++) {
+    try {
+      response = await fetch(target, { headers, signal: AbortSignal.timeout(timeoutMs) });
+      break;
+    } catch (error) {
+      lastError = error;
+      if (attempt >= attempts) throw error;
+      await sleep(retryDelayMs);
+    }
+  }
+  if (!response) throw lastError instanceof Error ? lastError : new Error(String(lastError || 'Remote storage fetch failed'));
+
   const responseHeaders = ['content-type', 'content-length', 'content-range', 'accept-ranges', 'etag', 'last-modified'];
 
   res.status(response.status);
