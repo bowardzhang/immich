@@ -1,9 +1,11 @@
 // Railway Serverless entry point for the fixed Photo Storage pool.
 //
-// The core router still contains optional background monitoring/self-test timers
-// for non-serverless/manual operation. In production we keep the Router purely
-// request-driven so it can sleep when Immich is idle and so it does not wake
-// sleeping Photo Storage nodes on its own.
+// Keep the Router request-driven so Railway can sleep it when idle.
+// Also apply a narrow runtime compatibility patch before loading server.mjs:
+// undici fetch() Response headers are immutable, so route diagnostics must be
+// merged into the outgoing Node response instead of mutating upstream.headers.
+
+import { readFile, writeFile } from 'node:fs/promises';
 
 const nativeSetInterval = globalThis.setInterval;
 const nativeSetTimeout = globalThis.setTimeout;
@@ -43,7 +45,23 @@ globalThis.setTimeout = function serverlessSetTimeout(callback, delay, ...args) 
   return nativeSetTimeout(callback, delay, ...args);
 };
 
-await import('./server.mjs');
+const sourceUrl = new URL('./server.mjs', import.meta.url);
+const runtimeUrl = new URL('./server-runtime.mjs', import.meta.url);
+let source = await readFile(sourceUrl, 'utf8');
+
+const oldProxy = `async function proxyResponse(res, upstream) {\n  res.writeHead(upstream.status, Object.fromEntries(upstream.headers.entries()));`;
+const newProxy = `async function proxyResponse(res, upstream, extraHeaders = {}) {\n  res.writeHead(upstream.status, { ...Object.fromEntries(upstream.headers.entries()), ...extraHeaders });`;
+const oldRoute = `      if (found.via === 'basename' || found.path !== relative) upstream.headers.set('x-storage-resolved-path', found.path);\n      upstream.headers.set('x-storage-route', found.via);\n      upstream.headers.set('x-storage-node', found.node.name);\n      return proxyResponse(res, upstream);`;
+const newRoute = `      const routeHeaders = {\n        'x-storage-route': found.via,\n        'x-storage-node': found.node.name,\n        ...((found.via === 'basename' || found.path !== relative) ? { 'x-storage-resolved-path': found.path } : {}),\n      };\n      return proxyResponse(res, upstream, routeHeaders);`;
+
+if (!source.includes(oldProxy) || !source.includes(oldRoute)) {
+  throw new Error('Storage Router response-header compatibility patch no longer matches server.mjs');
+}
+source = source.replace(oldProxy, newProxy).replace(oldRoute, newRoute);
+await writeFile(runtimeUrl, source, 'utf8');
+
+console.log(JSON.stringify({ event: 'storage-router-response-header-patch', applied: true }));
+await import('./server-runtime.mjs');
 
 console.log(JSON.stringify({
   event: 'storage-router-mode',
