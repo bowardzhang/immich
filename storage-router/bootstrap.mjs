@@ -25,8 +25,10 @@ const TOKEN = process.env.REMOTE_STORAGE_TOKEN || '';
 const CHECK_MS = Number(process.env.STORAGE_PROVISION_CHECK_INTERVAL_MS || 60 * 1000);
 const CONFIGURED_TRIGGER_PERCENT = Number(process.env.STORAGE_PROVISION_TRIGGER_PERCENT || 82);
 const RETRY_MS = Number(process.env.STORAGE_PROVISION_RETRY_INTERVAL_MS || 15 * 1000);
+const FORCE_PROVISION = process.env.STORAGE_PROVISION_FORCE === 'true';
 let checkRunning = false;
 let retryTimer = null;
+let forceConsumed = false;
 
 async function verifyProvisioning() {
   if (!provisioningEnabled()) {
@@ -63,18 +65,21 @@ async function checkProvisioning() {
     const warningPercent = Number(status.warningPercent || 85);
     const triggerPercent = Math.min(warningPercent, CONFIGURED_TRIGGER_PERCENT);
     const allTrigger = volumes.length > 0 && volumes.every((item) => item.healthy && item.usagePercent >= triggerPercent);
-    if (!allTrigger || status.volumeLimitReached) return;
+    const forceThisCheck = FORCE_PROVISION && !forceConsumed;
+    if ((!allTrigger && !forceThisCheck) || status.volumeLimitReached) return;
 
     console.log(JSON.stringify({
       event: 'storage-provision-trigger',
       volumes: volumes.length,
       triggerPercent,
       warningPercent,
-      usages: volumes.map((item) => ({ name: item.name, usagePercent: item.usagePercent })),
+      forced: forceThisCheck,
+      usages: volumes.map((item) => ({ name: item.name, usagePercent: item.usagePercent, healthy: item.healthy })),
     }));
 
-    const result = await ensureNextVolume(volumes.map((item) => ({ name: item.name, url: item.url })));
-    console.log(JSON.stringify({ event: 'storage-provision-result', triggerPercent, result }));
+    const result = await ensureNextVolume(volumes.map((item) => ({ name: item.name, url: item.url })), forceThisCheck);
+    if (forceThisCheck && result?.status !== 'busy') forceConsumed = true;
+    console.log(JSON.stringify({ event: 'storage-provision-result', triggerPercent, forced: forceThisCheck, result }));
     if (result?.status === 'busy') scheduleRetry();
   } catch (error) {
     console.error(`Automatic storage provisioning check failed: ${error instanceof Error ? error.message : String(error)}`);
