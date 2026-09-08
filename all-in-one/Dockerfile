@@ -23,7 +23,9 @@ COPY package.json .pnpmfile.cjs pnpm-lock.yaml pnpm-workspace.yaml ./
 COPY ./web ./web/
 COPY ./i18n ./i18n/
 COPY ./packages ./packages/
-RUN SHARP_IGNORE_GLOBAL_LIBVIPS=true pnpm --filter @immich/sdk --filter immich-web install --frozen-lockfile --force && \
+COPY ./all-in-one/patch-web-thumbnail-cache.mjs ./all-in-one/patch-web-thumbnail-cache.mjs
+RUN node ./all-in-one/patch-web-thumbnail-cache.mjs && \
+    SHARP_IGNORE_GLOBAL_LIBVIPS=true pnpm --filter @immich/sdk --filter immich-web install --frozen-lockfile --force && \
     pnpm --filter @immich/sdk --filter immich-web build
 
 FROM builder AS cli-build
