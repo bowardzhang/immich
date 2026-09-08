@@ -137,7 +137,7 @@ async function getServiceSource(serviceId) {
   const data = await gql(
     `query serviceSource($projectId: String!, $serviceId: String!, $environmentId: String!) {
       serviceInstance(serviceId: $serviceId, environmentId: $environmentId) {
-        source { repo image branch }
+        source { repo image }
       }
       deploymentTriggers(
         projectId: $projectId,
@@ -156,7 +156,6 @@ async function getServiceSource(serviceId) {
   const expectedTrigger = triggers.find((item) => item.repository === REPO && item.branch === BRANCH);
   return {
     repo: source.repo,
-    sourceBranch: source.branch,
     expectedTrigger,
     triggers,
   };
@@ -213,7 +212,6 @@ async function ensureDeploymentTrigger(serviceId, index) {
     expectedRepo: REPO,
     expectedBranch: BRANCH,
     currentRepo: state.repo || null,
-    currentSourceBranch: state.sourceBranch || null,
     currentTriggers: state.triggers.map((item) => ({ repository: item.repository, branch: item.branch })),
   }));
 
@@ -271,7 +269,7 @@ async function ensureDeploymentTrigger(serviceId, index) {
 
   throw new Error(
     `Photo Storage ${index} source trigger is not ready: expected repo=${REPO} branch=${BRANCH}, ` +
-    `got repo=${state.repo || 'missing'} sourceBranch=${state.sourceBranch || 'missing'} ` +
+    `got repo=${state.repo || 'missing'} ` +
     `triggers=${JSON.stringify(state.triggers.map((item) => ({ repository: item.repository, branch: item.branch })))}.`,
   );
 }
