@@ -66,7 +66,7 @@ export class ServerService extends BaseService {
     return {
       arm64v8a: `${baseUrl}/app-arm64-v8a-release.apk`,
       armeabiv7a: `${baseUrl}/app-armeabi-v7a-release.apk`,
-      universal: `${baseUrl}/app-release.apk`,
+      universal: `${baseUrl}/app-universal-release.apk`,
       x86_64: `${baseUrl}/app-x86_64-release.apk`,
     };
   }
@@ -179,13 +179,13 @@ export class ServerService extends BaseService {
       loginPageMessage: config.server.loginPageMessage,
       trashDays: config.trash.days,
       userDeleteDelay: config.user.deleteDelay,
-      oauthButtonText: config.oauth.buttonText,
+      oauthButtonText: config.oauthButtonText,
       isInitialized,
       isOnboarded: onboarding?.isOnboarded || false,
       externalDomain: config.server.externalDomain,
       publicUsers: config.server.publicUsers,
-      mapDarkStyleUrl: config.map.darkStyleUrl,
-      mapLightStyleUrl: config.map.lightStyleUrl,
+      mapDarkStyleUrl: config.map.darkStyle,
+      mapLightStyleUrl: config.map.lightStyle,
       maintenanceMode: false,
       minFaces: config.machineLearning.facialRecognition.minFaces,
     };
@@ -241,7 +241,6 @@ export class ServerService extends BaseService {
     if (!license) {
       throw new NotFoundException();
     }
-
     return license;
   }
 
