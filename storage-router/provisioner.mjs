@@ -227,18 +227,17 @@ async function createOrReuseVolume(serviceId, index) {
     ),
   );
   if (attached) {
-    const volume = await renameVolumeIfNeeded(attached, expectedName);
     console.log(
       JSON.stringify({
         event: 'storage-provision',
         action: 'reuse-attached-volume',
         index,
         serviceId,
-        volumeId: volume.id,
-        name: volume.name,
+        volumeId: attached.id,
+        name: attached.name,
       }),
     );
-    return volume;
+    return attached;
   }
 
   const sameName = volumes.find((volume) => volume.name === expectedName);
