@@ -98,7 +98,20 @@ async function listServices() {
 
 async function listVolumes() {
   const data = await gql(
-    `query project($id: String!) { project(id: $id) { volumes { edges { node { id name createdAt } } } } }`,
+    `query project($id: String!) {
+      project(id: $id) {
+        volumes {
+          edges {
+            node {
+              id
+              name
+              createdAt
+              volumeInstances { edges { node { id serviceId environmentId mountPath } } }
+            }
+          }
+        }
+      }
+    }`,
     { id: PROJECT_ID },
   );
   return data.project?.volumes?.edges?.map((edge) => edge.node) || [];
@@ -195,12 +208,51 @@ async function configureService(serviceId) {
   );
 }
 
+async function renameVolumeIfNeeded(volume, expectedName) {
+  if (volume.name === expectedName) return { ...volume, name: expectedName };
+  const data = await gql(
+    `mutation volumeUpdate($volumeId: String!, $input: VolumeUpdateInput!) { volumeUpdate(volumeId: $volumeId, input: $input) { id name } }`,
+    { volumeId: volume.id, input: { name: expectedName } },
+  );
+  return { ...volume, ...data.volumeUpdate, name: expectedName };
+}
+
 async function createOrReuseVolume(serviceId, index) {
   const expectedName = `Photo Storage Volume ${index}`;
-  const existing = (await listVolumes()).find((volume) => volume.name === expectedName);
-  if (existing) {
-    console.log(JSON.stringify({ event: 'storage-provision', action: 'reuse-volume', index, volumeId: existing.id, name: expectedName }));
-    return existing;
+  const volumes = await listVolumes();
+
+  const attached = volumes.find((volume) =>
+    volume.volumeInstances?.edges?.some(
+      (edge) => edge.node?.serviceId === serviceId && edge.node?.environmentId === ENVIRONMENT_ID,
+    ),
+  );
+  if (attached) {
+    const volume = await renameVolumeIfNeeded(attached, expectedName);
+    console.log(
+      JSON.stringify({
+        event: 'storage-provision',
+        action: 'reuse-attached-volume',
+        index,
+        serviceId,
+        volumeId: volume.id,
+        name: volume.name,
+      }),
+    );
+    return volume;
+  }
+
+  const sameName = volumes.find((volume) => volume.name === expectedName);
+  if (sameName) {
+    console.warn(
+      JSON.stringify({
+        event: 'storage-provision',
+        action: 'ignore-unattached-volume',
+        index,
+        serviceId,
+        volumeId: sameName.id,
+        name: expectedName,
+      }),
+    );
   }
 
   const created = await gql(
@@ -215,13 +267,7 @@ async function createOrReuseVolume(serviceId, index) {
     },
   );
   const volume = created.volumeCreate;
-
-  await gql(
-    `mutation volumeUpdate($volumeId: String!, $input: VolumeUpdateInput!) { volumeUpdate(volumeId: $volumeId, input: $input) { id name } }`,
-    { volumeId: volume.id, input: { name: expectedName } },
-  );
-
-  return { ...volume, name: expectedName };
+  return renameVolumeIfNeeded(volume, expectedName);
 }
 
 async function setRouterNodes(nodes) {
