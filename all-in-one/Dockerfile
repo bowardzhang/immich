@@ -51,9 +51,6 @@ RUN mise //:plugins
 FROM ghcr.io/immich-app/base-server-prod:202607211135@sha256:ced131da7523544fe975cfd25abd67386e712e39496340b437cd95a08d0a18f3 AS runtime
 ENV DEBIAN_FRONTEND=noninteractive
 
-# Install basic runtime tools first, without Debian's postgresql-common. Then add PGDG
-# and resolve all PostgreSQL packages from the same repository generation. HTTP is
-# acceptable here because apt verifies the repository metadata with the pinned PGDG key.
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates curl wget gnupg redis-server supervisor && \
     mkdir -p /usr/share/postgresql-common/pgdg && \
@@ -80,6 +77,7 @@ COPY LICENSE /LICENSE
 COPY all-in-one/entrypoint.sh /usr/local/bin/immich-aio-entrypoint
 COPY all-in-one/supervisord.conf /etc/supervisor/conf.d/immich-aio.conf
 COPY all-in-one/healthcheck.sh /usr/local/bin/immich-aio-healthcheck
+COPY all-in-one/audit-thumbnails.mjs /usr/local/lib/immich-aio/audit-thumbnails.mjs
 RUN chmod +x /usr/local/bin/immich-aio-entrypoint /usr/local/bin/immich-aio-healthcheck
 
 ENV PATH="${PATH}:/usr/src/app/server/bin" \
