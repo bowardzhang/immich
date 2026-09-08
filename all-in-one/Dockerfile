@@ -59,7 +59,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     . /etc/os-release && \
     echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] http://apt.postgresql.org/pub/repos/apt ${VERSION_CODENAME}-pgdg main" > /etc/apt/sources.list.d/pgdg.list && \
     apt-get update && \
-    apt-get install -y --no-install-recommends postgresql-common postgresql-client-common postgresql-14 postgresql-client-14 && \
+    apt-get install -y --no-install-recommends postgresql-common postgresql-client-common postgresql-14 postgresql-client-14 postgresql-14-pgvector && \
     ARCH="$(dpkg --print-architecture)" && \
     wget -q -O /tmp/vchord.deb "https://github.com/tensorchord/VectorChord/releases/download/0.4.3/postgresql-14-vchord_0.4.3-1_${ARCH}.deb" && \
     wget -q -O /tmp/pgvectors.deb "https://github.com/tensorchord/pgvecto.rs/releases/download/v0.2.0/vectors-pg14_0.2.0_${ARCH}.deb" && \
