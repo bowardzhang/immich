@@ -66,7 +66,7 @@ export class ServerService extends BaseService {
     return {
       arm64v8a: `${baseUrl}/app-arm64-v8a-release.apk`,
       armeabiv7a: `${baseUrl}/app-armeabi-v7a-release.apk`,
-      universal: `${baseUrl}/app-universal-release.apk`,
+      universal: `${baseUrl}/app-release.apk`,
       x86_64: `${baseUrl}/app-x86_64-release.apk`,
     };
   }
@@ -179,7 +179,7 @@ export class ServerService extends BaseService {
       loginPageMessage: config.server.loginPageMessage,
       trashDays: config.trash.days,
       userDeleteDelay: config.user.deleteDelay,
-      oauthButtonText: config.oauthButtonText,
+      oauthButtonText: config.oauth.buttonText,
       isInitialized,
       isOnboarded: onboarding?.isOnboarded || false,
       externalDomain: config.server.externalDomain,
@@ -259,7 +259,9 @@ export class ServerService extends BaseService {
     }
 
     const licenseData = { ...dto, activatedAt: new Date() };
+
     await this.systemMetadataRepository.set(SystemMetadataKey.License, licenseData);
+
     return licenseData;
   }
 }
