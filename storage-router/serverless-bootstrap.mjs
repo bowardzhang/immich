@@ -1,4 +1,5 @@
 // Serverless entry point for Railway.
+// This is also the steady-state mode restored after any one-shot provisioning run.
 //
 // The normal server keeps two background timers alive:
 //   1. a periodic pool monitor that calls /api/storage on every Photo Storage node;
