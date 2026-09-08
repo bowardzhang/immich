@@ -91,56 +91,67 @@ That is 64 MiB reserved to reduce race conditions near a full volume.
 
 ## Capacity monitoring
 
-The router periodically collects capacity and health from every configured node.
+The router collects capacity and health from every configured node once per minute. Automatic expansion is deliberately **proactive**: provisioning starts when all healthy volumes reach the expansion trigger (82% by default), leaving headroom for Railway to create, configure, deploy and health-check the next node before the normal 85% warning level is reached.
 
 ```mermaid
 flowchart TD
-    A[Periodic check] --> B[Query every node]
+    A[Check every 60 seconds] --> B[Query every node]
     B --> C[Record health + used + free + capacity]
-    C --> D{All nodes >= 85%?}
+    C --> D{All nodes >= 82% expansion trigger?}
     D -- No --> E[Continue normal routing]
     D -- Yes --> F{Node count < limit?}
     F -- Yes --> G[Automatic provisioning]
     F -- No --> H[Capacity alert]
-    C --> I{Any >= 95%?}
-    I -- Yes --> J[Critical alert]
+    C --> I{All nodes >= 85%?}
+    I -- Yes --> J[Warning alert]
+    C --> K{All nodes >= 95%?}
+    K -- Yes --> L[Critical alert]
 ```
 
-Defaults:
+Production defaults:
 
 ```text
+STORAGE_PROVISION_TRIGGER_PERCENT=82
 STORAGE_WARNING_PERCENT=85
 STORAGE_CRITICAL_PERCENT=95
-STORAGE_CHECK_INTERVAL_MS=900000
+STORAGE_CHECK_INTERVAL_MS=60000
+STORAGE_PROVISION_CHECK_INTERVAL_MS=60000
+STORAGE_PROVISION_RETRY_INTERVAL_MS=15000
 STORAGE_ALLOCATION_SAFETY_BYTES=67108864
 ```
+
+If provisioning fails after the expansion trigger has been reached, the controller retries after 15 seconds instead of waiting for the normal polling cycle. Normal polling continues every 60 seconds.
 
 Immich's storage endpoint uses Router aggregate capacity, allowing mobile/web clients to display the logical pool size instead of only Immich's local `/data` filesystem.
 
 ## Automatic Railway expansion
 
-When every configured volume is healthy and above the warning threshold, `bootstrap.mjs` can provision the next `Photo Storage N`.
+When every configured volume is healthy and above the proactive expansion trigger, `bootstrap.mjs` provisions the next `Photo Storage N`. The warning threshold remains 85%; the lower expansion trigger exists only to provide build/deployment headroom.
 
 ```mermaid
 flowchart TD
-    A[Trigger expansion] --> B[Find Photo Storage N]
+    A[All healthy nodes >= 82%] --> B[Find Photo Storage N]
     B --> C{Service exists?}
     C -- No --> D[Create service with project + environment + repo + branch]
     C -- Yes --> E[Reuse service]
-    D --> F[Configure /photo-storage]
+    D --> F[Configure repo + /photo-storage]
     E --> F
-    F --> G[Create or reuse persistent volume]
-    G --> H[Mount at /photos_extern]
-    H --> I[Deploy]
-    I --> J[Poll deployment]
-    J --> K{SUCCESS?}
-    K -- No --> X[Fail without adding node]
-    K -- Yes --> L[Wait for /health]
-    L --> M[Update STORAGE_NODES]
-    M --> N[Redeploy Storage Router]
+    F --> G[Create/verify GitHub deployment trigger branch]
+    G --> H[Verify repo + branch]
+    H --> I[Create or reuse exactly one persistent volume]
+    I --> J[Mount at /photos_extern]
+    J --> K[Deploy]
+    K --> L[Poll deployment]
+    L --> M{SUCCESS?}
+    M -- No --> X[Retry after 15 seconds]
+    M -- Yes --> N[Wait for /health]
+    N --> O[Update STORAGE_NODES]
+    O --> P[Redeploy Storage Router]
 ```
 
-The service-create request explicitly supplies the configured GitHub repository and branch. Defaults are:
+The provisioner explicitly supplies the configured GitHub repository and branch. It also verifies the Railway deployment trigger and refuses to deploy or attach another volume until the expected repository/branch are confirmed. This prevents a newly created Photo Storage service from deploying with a missing branch and prevents recovery retries from accidentally attaching a second volume to the same service.
+
+Defaults are:
 
 ```text
 STORAGE_REPO=bowardzhang/immich
@@ -166,7 +177,9 @@ Optional controls:
 
 ```text
 STORAGE_AUTO_PROVISION=false
-STORAGE_PROVISION_CHECK_INTERVAL_MS=300000
+STORAGE_PROVISION_TRIGGER_PERCENT=82
+STORAGE_PROVISION_CHECK_INTERVAL_MS=60000
+STORAGE_PROVISION_RETRY_INTERVAL_MS=15000
 STORAGE_PROVISION_COOLDOWN_MS=3600000
 STORAGE_PROVISION_DEPLOY_TIMEOUT_MS=300000
 STORAGE_PROVISION_HEALTH_TIMEOUT_MS=120000
