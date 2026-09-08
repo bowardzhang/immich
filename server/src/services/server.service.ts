@@ -33,6 +33,8 @@ interface RemoteStorageInfo {
 
 @Injectable()
 export class ServerService extends BaseService {
+  private remoteStorageInfoCache: RemoteStorageInfo | null = null;
+
   @OnEvent({ name: 'AppBootstrap' })
   async onBootstrap(): Promise<void> {
     const featureFlags = await this.getFeatures();
@@ -77,9 +79,10 @@ export class ServerService extends BaseService {
 
     try {
       const token = process.env.REMOTE_STORAGE_TOKEN;
+      const timeoutMs = Number(process.env.REMOTE_STORAGE_INFO_TIMEOUT_MS || 20_000);
       const response = await fetch(`${remoteStorageUrl}/api/storage`, {
         headers: token ? { authorization: `Bearer ${token}` } : undefined,
-        signal: AbortSignal.timeout(5000),
+        signal: AbortSignal.timeout(Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : 20_000),
       });
       if (!response.ok) {
         throw new Error(`${response.status} ${response.statusText}`);
@@ -92,8 +95,14 @@ export class ServerService extends BaseService {
         throw new Error('Storage Router returned invalid capacity data');
       }
 
-      return { totalBytes, availableBytes: Math.min(availableBytes, totalBytes) };
+      const info = { totalBytes, availableBytes: Math.min(availableBytes, totalBytes) };
+      this.remoteStorageInfoCache = info;
+      return info;
     } catch (error) {
+      if (this.remoteStorageInfoCache) {
+        this.logger.warn(`Unable to refresh aggregate remote storage capacity; using last successful value: ${error}`);
+        return this.remoteStorageInfoCache;
+      }
       this.logger.warn(`Unable to read aggregate remote storage capacity; falling back to local storage: ${error}`);
       return null;
     }
@@ -175,8 +184,8 @@ export class ServerService extends BaseService {
       isOnboarded: onboarding?.isOnboarded || false,
       externalDomain: config.server.externalDomain,
       publicUsers: config.server.publicUsers,
-      mapDarkStyleUrl: config.map.darkStyle,
-      mapLightStyleUrl: config.map.lightStyle,
+      mapDarkStyleUrl: config.map.darkStyleUrl,
+      mapLightStyleUrl: config.map.lightStyleUrl,
       maintenanceMode: false,
       minFaces: config.machineLearning.facialRecognition.minFaces,
     };
@@ -232,27 +241,16 @@ export class ServerService extends BaseService {
     if (!license) {
       throw new NotFoundException();
     }
+
     return license;
   }
 
   async setLicense(dto: LicenseKeyDto): Promise<LicenseResponseDto> {
-    if (!dto.licenseKey.startsWith('IMSV-')) {
-      throw new BadRequestException('Invalid license key');
-    }
-    const { licensePublicKey } = this.configRepository.getEnv();
-    const isLicenseValid = this.cryptoRepository.verifySha256(
-      dto.licenseKey,
-      dto.activationKey,
-      licensePublicKey.server,
-    );
-    if (!isLicenseValid) {
+    const license = await this.serverInfoRepository.setLicense(dto.licenseKey, dto.activationKey);
+    if (!license) {
       throw new BadRequestException('Invalid license key');
     }
 
-    const licenseData = { ...dto, activatedAt: new Date() };
-
-    await this.systemMetadataRepository.set(SystemMetadataKey.License, licenseData);
-
-    return licenseData;
+    return license;
   }
 }
