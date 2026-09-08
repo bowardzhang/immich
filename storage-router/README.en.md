@@ -53,17 +53,23 @@ sequenceDiagram
     R->>N1: capacity / health
     R->>N2: capacity / health
     R->>R: choose best eligible node
-    R->>N2: stream upload
-    alt upload succeeds
+    par parallel
+      R->>N2: stream upload
+    and
+      R->>R: temporary spool
+    end
+    alt primary upload succeeds
       N2-->>R: success
       R-->>I: success
-    else upload fails
+    else primary upload fails
       N2-->>R: error
-      R->>N1: retry upload
+      R->>N1: replay from spool
       N1-->>R: success
       R-->>I: success
     end
 ```
+
+The normal path sends media from Router to Photo Storage only once. The temporary spool is written in parallel and is replayed only for failover. If the client aborts the upload, Router tears down the active branches and cleans the temporary spool.
 
 ## `STORAGE_NODES`
 
@@ -140,18 +146,27 @@ flowchart TD
     E --> F
     F --> G[Create/verify GitHub deployment trigger branch]
     G --> H[Verify repo + branch]
-    H --> I[Create or reuse exactly one persistent volume]
-    I --> J[Mount at /photos_extern]
-    J --> K[Deploy]
-    K --> L[Poll deployment]
-    L --> M{SUCCESS?}
-    M -- No --> X[Retry after 15 seconds]
-    M -- Yes --> N[Wait for /health]
-    N --> O[Update STORAGE_NODES]
-    O --> P[Redeploy Storage Router]
+    H --> I{Volume already exists?}
+    I -- Yes --> J[Reuse the single existing volume]
+    I -- No --> K[Create persistent volume]
+    J --> L[Mount at /photos_extern]
+    K --> L
+    L --> M[Deploy]
+    M --> N[Poll deployment]
+    N --> O{SUCCESS?}
+    O -- No --> X[Recover/retry after 15 seconds]
+    O -- Yes --> P[Wait for /health]
+    P --> Q[Update STORAGE_NODES]
+    Q --> R[Redeploy Storage Router]
 ```
 
-The provisioner explicitly supplies the configured GitHub repository and branch. It also verifies the Railway deployment trigger and refuses to deploy or attach another volume until the expected repository/branch are confirmed. This prevents a newly created Photo Storage service from deploying with a missing branch and prevents recovery retries from accidentally attaching a second volume to the same service.
+Key safeguards:
+
+- New nodes explicitly use `bowardzhang/immich` and production branch `3.1.0-remote`.
+- Creation and recovery verify the GitHub deployment trigger repository and branch.
+- If the service already has one volume, recovery reuses it instead of accidentally creating a second volume.
+- A node joins the active pool only after deployment is `SUCCESS` and `/health` succeeds.
+- A `checkRunning` guard prevents the regular check and fast retry paths from starting two provisioning flows concurrently.
 
 Defaults are:
 
@@ -218,7 +233,7 @@ At the configured maximum node count, the system alerts instead of attempting to
 
 Production self-tests write under `.storage-router-selftest/`, verify the file lifecycle and delete test files during normal and best-effort failure cleanup. Upload staging uses ephemeral `/tmp`, not persistent Photo Storage volumes.
 
-Repository regression tests such as `test-multi-volume.mjs` use in-memory mock volumes. `test-storage.ps1` uses a dedicated temporary prefix and attempts cleanup in `finally`. These test scripts are not copied into the production Router image.
+Repository regression tests such as `test-multi-volume.mjs` use in-memory mock volumes and cover normal streaming uploads, chunked bodies without `Content-Length`, spool failover after primary-node failure, and cleanup/recovery after client-aborted uploads. Test-only scripts are not copied into the production Router image.
 
 ## Media-processing compatibility
 
@@ -237,6 +252,21 @@ flowchart LR
 ## Operational rule for `/data`
 
 Do not delete Immich-managed `thumbs`, `encoded-video`, `profile`, `backups` or similar `/data` content merely because original photos and videos are remote. `/data` remains part of the Immich application architecture.
+
+## Railway Watch Paths
+
+Production Router watches only the core files that affect its runtime image, for example:
+
+```text
+/storage-router/server.mjs
+/storage-router/bootstrap.mjs
+/storage-router/provisioner.mjs
+/storage-router/selftest.mjs
+/storage-router/package.json
+/storage-router/Dockerfile
+```
+
+Changing `storage-router/README.md`, its English counterpart, or test-only files therefore does not restart the production Router.
 
 ## Upgrading Immich
 
@@ -257,6 +287,7 @@ Do not blindly deploy upstream `main`. Verify database migrations, upload/read/d
 
 ## Related documentation
 
-- [`../README.md`](../README.md) — fork overview and architecture
-- [`../RAILWAY_REMOTE_STORAGE.md`](../RAILWAY_REMOTE_STORAGE.md) — deployment, operational and upgrade notes
+- [中文版本（默认）](README.md)
+- [Fork overview — English](../README.en.md)
+- [Railway deployment, operations, and upgrades — English](../RAILWAY_REMOTE_STORAGE.en.md)
 - [Official Immich documentation](https://docs.immich.app/) — upstream application documentation
