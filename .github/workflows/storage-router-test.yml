@@ -3,10 +3,10 @@ name: Storage Router Integration Test
 on:
   workflow_dispatch:
   push:
+    branches: [3.2.1-remote]
     paths:
       - 'storage-router/**'
       - 'photo-storage/**'
-      - 'server/src/repositories/remote-storage.repository.ts'
       - '.github/workflows/storage-router-test.yml'
 
 jobs:
