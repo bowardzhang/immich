@@ -9,9 +9,10 @@ const failNextPut = [false, false];
 
 function startMock(index) {
   const server = http.createServer(async (req, res) => {
-    if (req.headers.authorization !== `Bearer ${TOKEN}`) return res.writeHead(401).end();
     const url = new URL(req.url, 'http://localhost');
     const path = url.searchParams.get('path') || '';
+    console.log(`[mock-${index + 1}] ${req.method} ${url.pathname} path=${JSON.stringify(path)} auth=${req.headers.authorization === `Bearer ${TOKEN}` ? 'ok' : 'bad'}`);
+    if (req.headers.authorization !== `Bearer ${TOKEN}`) return res.writeHead(401).end();
     const store = volumes[index];
     if (req.method === 'GET' && url.pathname === '/api/storage') {
       const used = [...store.values()].reduce((n, b) => n + b.length, 0);
@@ -60,8 +61,11 @@ function startMock(index) {
 function json(res, status, body) { res.writeHead(status, { 'content-type': 'application/json' }); res.end(JSON.stringify(body)); }
 function port(server) { return server.address().port; }
 async function request(base, path, options = {}) {
-  const response = await fetch(`${base}/api/file?path=${encodeURIComponent(path)}`, { ...options, headers: { authorization: `Bearer ${TOKEN}`, ...(options.headers || {}) } });
-  return response;
+  return fetch(`${base}/api/file?path=${encodeURIComponent(path)}`, { ...options, headers: { authorization: `Bearer ${TOKEN}`, ...(options.headers || {}) } });
+}
+async function responseDetail(response) {
+  const body = await response.clone().text().catch((error) => `<body read failed: ${error.message}>`);
+  return `status=${response.status} body=${JSON.stringify(body)}`;
 }
 async function waitForHealth(base) {
   for (let i = 0; i < 30; i++) {
@@ -87,47 +91,42 @@ const routerProcess = spawn(process.execPath, ['storage-router/server.mjs'], {
   },
   stdio: ['ignore', 'pipe', 'pipe'],
 });
-routerProcess.stderr.on('data', (d) => process.stderr.write(d));
+routerProcess.stdout.on('data', (d) => process.stdout.write(`[router] ${d}`));
+routerProcess.stderr.on('data', (d) => process.stderr.write(`[router stderr] ${d}`));
 
 try {
   const base = `http://127.0.0.1:${routerPort}`;
   await waitForHealth(base);
 
-  // Seed after the router is ready. Exact lookup must not depend on stale negative state.
   volumes[0].set('existing/on-volume-1.txt', Buffer.from('volume-one'));
   let r = await request(base, 'existing/on-volume-1.txt');
-  assert(r.status === 200 && (await r.text()) === 'volume-one', 'existing file lookup failed');
+  const existingText = await r.clone().text().catch(() => '');
+  assert(r.status === 200 && existingText === 'volume-one', `existing file lookup failed: ${await responseDetail(r)}`);
 
-  // New files should go to the volume with the most free space.
   r = await request(base, 'new/on-volume-2.txt', { method: 'PUT', body: 'volume-two' });
-  assert(r.status === 201, `new-file PUT returned ${r.status}`);
+  assert(r.status === 201, `new-file PUT returned ${await responseDetail(r)}`);
   assert(volumes[0].has('new/on-volume-2.txt') === false, 'new file incorrectly allocated to volume 1');
   assert(volumes[1].has('new/on-volume-2.txt'), 'new file was not allocated to volume 2');
 
-  // Chunked uploads without Content-Length must stream successfully to the primary volume.
   const chunkedPath = 'new/chunked-stream.txt';
   const chunkedBody = Readable.from([Buffer.from('chunked-'), Buffer.from('stream')]);
   r = await request(base, chunkedPath, { method: 'PUT', body: chunkedBody, duplex: 'half' });
-  assert(r.status === 201, `chunked PUT returned ${r.status}`);
+  assert(r.status === 201, `chunked PUT returned ${await responseDetail(r)}`);
   assert(volumes[1].get(chunkedPath)?.toString() === 'chunked-stream', 'chunked upload content mismatch');
 
-  // If the streamed primary write fails, the completed spool must be replayed to another eligible volume.
   const failoverPath = 'new/stream-failover.txt';
   failNextPut[1] = true;
   const failoverBody = Readable.from([Buffer.from('stream-'), Buffer.from('failover')]);
   r = await request(base, failoverPath, { method: 'PUT', body: failoverBody, duplex: 'half' });
-  assert(r.status === 201, `stream failover PUT returned ${r.status}`);
+  assert(r.status === 201, `stream failover PUT returned ${await responseDetail(r)}`);
   assert(!volumes[1].has(failoverPath), 'failed primary unexpectedly retained the failover file');
   assert(volumes[0].get(failoverPath)?.toString() === 'stream-failover', 'spool failover did not preserve upload content');
 
-  // A client abort must not kill or wedge the router, and must not commit a partial object.
   const abortedPath = 'new/client-aborted.txt';
   await new Promise((resolve) => {
     const req = http.request({
-      hostname: '127.0.0.1',
-      port: routerPort,
-      path: `/api/file?path=${encodeURIComponent(abortedPath)}`,
-      method: 'PUT',
+      hostname: '127.0.0.1', port: routerPort,
+      path: `/api/file?path=${encodeURIComponent(abortedPath)}`, method: 'PUT',
       headers: { authorization: `Bearer ${TOKEN}`, 'content-type': 'application/octet-stream', 'content-length': '100000' },
     });
     let settled = false;
@@ -141,16 +140,14 @@ try {
   assert(r.status === 200, 'router did not recover after client-aborted upload');
   assert(!volumes[0].has(abortedPath) && !volumes[1].has(abortedPath), 'client-aborted upload committed a partial file');
 
-  // LIST must merge both volumes.
   r = await fetch(`${base}/api/list?path=&recursive=true`, { headers: { authorization: `Bearer ${TOKEN}` } });
   const listed = await r.json();
   const paths = new Set(listed.entries.map((e) => e.path));
   assert(paths.has('existing/on-volume-1.txt') && paths.has('new/on-volume-2.txt') && paths.has(chunkedPath) && paths.has(failoverPath), 'merged LIST is incomplete');
 
-  // Cross-volume MOVE: source on volume 1 -> destination selected on volume 2.
   const moveTarget = 'moved/to-volume-2.txt';
   r = await fetch(`${base}/api/file?path=${encodeURIComponent(moveTarget)}&source=${encodeURIComponent('existing/on-volume-1.txt')}`, { method: 'MOVE', headers: { authorization: `Bearer ${TOKEN}` } });
-  assert(r.status === 200, `cross-volume MOVE returned ${r.status}`);
+  assert(r.status === 200, `cross-volume MOVE returned ${await responseDetail(r)}`);
   assert(!volumes[0].has('existing/on-volume-1.txt'), 'MOVE did not delete source from volume 1');
   assert(volumes[1].has(moveTarget), 'MOVE did not create target on volume 2');
 
