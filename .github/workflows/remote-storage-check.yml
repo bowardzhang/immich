@@ -45,5 +45,9 @@ jobs:
           node-version: 22
           cache: pnpm
       - run: pnpm install --frozen-lockfile
+      - name: Build server workspace dependencies
+        run: |
+          pnpm --filter @immich/sdk build
+          pnpm --filter @immich/plugin-sdk build
       - run: node ./all-in-one/patch-remote-media-input.mjs
       - run: pnpm --filter immich check
