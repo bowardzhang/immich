@@ -2,9 +2,14 @@ name: Remote Storage Check
 
 on:
   pull_request:
-    branches: [3.1.0-remote]
+    branches: [3.2.1-remote]
   push:
-    branches: [feature/remote-external-library-3.1.0]
+    branches: [3.2.1-remote]
+    paths:
+      - 'photo-storage/**'
+      - 'storage-router/**'
+      - 'server/src/repositories/remote-storage.repository.ts'
+      - '.github/workflows/remote-storage-check.yml'
 
 jobs:
   syntax:
