@@ -72,10 +72,11 @@ async function waitForHealth(base) {
 }
 
 const mocks = await Promise.all([startMock(0), startMock(1)]);
-const router = spawn(process.execPath, ['storage-router/server.mjs'], {
+const routerPort = 18180;
+const routerProcess = spawn(process.execPath, ['storage-router/server.mjs'], {
   env: {
     ...process.env,
-    PORT: '0',
+    PORT: String(routerPort),
     REMOTE_STORAGE_TOKEN: TOKEN,
     STORAGE_ALLOCATION_SAFETY_BYTES: '0',
     STORAGE_CHECK_INTERVAL_MS: '3600000',
@@ -86,25 +87,13 @@ const router = spawn(process.execPath, ['storage-router/server.mjs'], {
   },
   stdio: ['ignore', 'pipe', 'pipe'],
 });
+routerProcess.stderr.on('data', (d) => process.stderr.write(d));
 
 try {
-  // Router does not accept PORT=0 through the child environment because it logs the actual bound port
-  // only through listen's callback; use a fixed free-enough test port instead.
-  router.kill();
-  await new Promise((resolve) => router.once('exit', resolve));
-  const routerPort = 18180;
-  const routerProcess = spawn(process.execPath, ['storage-router/server.mjs'], {
-    env: { ...process.env, PORT: String(routerPort), REMOTE_STORAGE_TOKEN: TOKEN, STORAGE_ALLOCATION_SAFETY_BYTES: '0', STORAGE_CHECK_INTERVAL_MS: '3600000', STORAGE_NODES: JSON.stringify([
-      { name: 'volume-1', url: `http://127.0.0.1:${port(mocks[0])}` },
-      { name: 'volume-2', url: `http://127.0.0.1:${port(mocks[1])}` },
-    ]) },
-    stdio: ['ignore', 'pipe', 'pipe'],
-  });
-  routerProcess.stderr.on('data', (d) => process.stderr.write(d));
   const base = `http://127.0.0.1:${routerPort}`;
   await waitForHealth(base);
 
-  // Seed a file on volume 1 and verify the router can discover it there.
+  // Seed after the router is ready. Exact lookup must not depend on stale negative state.
   volumes[0].set('existing/on-volume-1.txt', Buffer.from('volume-one'));
   let r = await request(base, 'existing/on-volume-1.txt');
   assert(r.status === 200 && (await r.text()) === 'volume-one', 'existing file lookup failed');
@@ -166,9 +155,9 @@ try {
   assert(volumes[1].has(moveTarget), 'MOVE did not create target on volume 2');
 
   console.log('ALL MULTI-VOLUME ROUTING TESTS PASSED');
-  routerProcess.kill();
-  await new Promise((resolve) => routerProcess.once('exit', resolve));
 } finally {
+  routerProcess.kill();
+  await new Promise((resolve) => routerProcess.once('exit', resolve)).catch(() => {});
   for (const server of mocks) server.close();
 }
 
