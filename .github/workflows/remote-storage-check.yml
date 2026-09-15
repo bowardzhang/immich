@@ -8,7 +8,9 @@ on:
     paths:
       - 'photo-storage/**'
       - 'storage-router/**'
-      - 'server/src/repositories/remote-storage.repository.ts'
+      - 'all-in-one/patch-remote-media-input.mjs'
+      - 'all-in-one/Dockerfile'
+      - 'server/src/repositories/media.repository.ts'
       - '.github/workflows/remote-storage-check.yml'
 
 jobs:
@@ -21,6 +23,17 @@ jobs:
           node-version: 22
       - run: node --check photo-storage/server.mjs
       - run: node --check storage-router/server.mjs
+      - run: node --check all-in-one/patch-remote-media-input.mjs
+
+  patch-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Verify v3.2.1 MediaRepository patch still applies
+        run: node ./all-in-one/patch-remote-media-input.mjs
 
   server-check:
     runs-on: ubuntu-latest
@@ -34,4 +47,5 @@ jobs:
           node-version: 22
           cache: pnpm
       - run: pnpm install --frozen-lockfile
+      - run: node ./all-in-one/patch-remote-media-input.mjs
       - run: pnpm --filter immich check
