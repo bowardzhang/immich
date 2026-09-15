@@ -1,0 +1,73 @@
+name: Publish Railway-tuned Android APK
+
+on:
+  push:
+    branches: [3.1.0-remote]
+    paths:
+      - '.github/workflows/publish-remote-android.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download successful APK artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p release
+          gh run download 34171613766 \
+            --repo "$GITHUB_REPOSITORY" \
+            --name immich-railway-android-debug \
+            --dir release
+          mv release/app-debug.apk release/immich-railway-v3.1.0-remote.1-debug.apk
+
+      - name: Generate checksum and release notes
+        run: |
+          cd release
+          sha256sum immich-railway-v3.1.0-remote.1-debug.apk > SHA256SUMS.txt
+          cd ..
+          cat > release-notes.md <<'EOF'
+          ## Railway-tuned Android build
+
+          This optional Android build is tuned for large photo/video backups to this fork's Railway deployment.
+
+          ### Main advantages
+
+          - Android HTTP read/write timeout increased from 60 seconds to **240 seconds**.
+          - Automatic foreground backup uses **one upload worker** instead of three concurrent workers, allowing one large file to use the available upstream bandwidth.
+          - Designed to work with this fork's streaming server upload path: `Android -> Immich streaming -> Storage Router staging -> Photo Storage N`.
+          - Intended to reduce long-upload failures and requests approaching Railway's public request-duration limit.
+
+          ### Important limitation
+
+          This is not resumable/chunked upload. If one file still cannot complete within the platform/network limit, resumable upload is the next architectural improvement rather than increasing timeouts indefinitely.
+
+          ### Build details
+
+          - Upstream/mobile baseline: Immich 3.1.0
+          - Fork branch: `3.1.0-remote`
+          - Build type: debug APK
+          - Source commit: `84e73776c360fe4fef1901ebb888e7462f8503a9`
+          - GitHub Actions run: `34171613766`
+
+          The debug application can normally coexist with the Play Store Immich app, but it requires separate server configuration/login.
+
+          Full documentation: [`ANDROID_RAILWAY.md`](https://github.com/bowardzhang/immich/blob/3.1.0-remote/ANDROID_RAILWAY.md)
+          EOF
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create android-v3.1.0-remote.1 \
+            release/immich-railway-v3.1.0-remote.1-debug.apk \
+            release/SHA256SUMS.txt \
+            --repo "$GITHUB_REPOSITORY" \
+            --target 3.1.0-remote \
+            --title "Immich Railway Android v3.1.0-remote.1" \
+            --notes-file release-notes.md
