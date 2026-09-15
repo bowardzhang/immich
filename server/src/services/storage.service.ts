@@ -17,7 +17,6 @@ import { JobOf, SystemFlags } from 'src/types';
 import { ImmichStartupError } from 'src/utils/misc';
 
 const docsMessage = `Please see https://docs.immich.app/administration/system-integrity#folder-checks for more information.`;
-const REMOTE_MEDIA_PREFIX = '/remote/photo-extern';
 
 @Injectable()
 export class StorageService extends BaseService {
@@ -58,17 +57,13 @@ export class StorageService extends BaseService {
       }
 
       let isUpdated = false;
-      const isRemoteMediaLocation = StorageCore.getMediaLocation().startsWith(REMOTE_MEDIA_PREFIX);
 
       this.logger.log(`Verifying system mount folder checks, current state: ${JSON.stringify(flags)}`);
 
       try {
+        // check each folder exists and is writable
         for (const folder of Object.values(StorageFolder)) {
-          const { internalPath } = this.getMountFilePaths(folder);
-          const remoteMarkerMissing =
-            isRemoteMediaLocation && !(await this.storageRepository.checkFileExists(internalPath));
-
-          if (!flags.mountChecks[folder] || remoteMarkerMissing) {
+          if (!flags.mountChecks[folder]) {
             this.logger.log(`Writing initial mount file for the ${folder} folder`);
             await this.createMountFile(folder);
           }
@@ -84,6 +79,7 @@ export class StorageService extends BaseService {
 
         if (isUpdated) {
           await this.systemMetadataRepository.set(SystemMetadataKey.SystemFlags, flags);
+          this.logger.log('Successfully enabled system mount folders checks');
         }
 
         this.logger.log('Successfully verified system mount folder checks');
@@ -122,19 +118,14 @@ export class StorageService extends BaseService {
             throw new Error(ErrorMessages.InconsistentMediaLocation);
           }
 
-          if (current.startsWith(REMOTE_MEDIA_PREFIX)) {
-            // Hybrid cutover: existing assets keep their original local paths.
-            // New assets use the remote media location. Do not rewrite DB paths or move old files.
-            this.logger.log(`Remote media cutover active; preserving existing asset paths under ${previous}`);
-          } else {
-            this.logger.warn(
-              `Detected a change to media location, performing an automatic migration of file paths from ${previous} to ${current}, this may take awhile`,
-            );
-            await this.databaseRepository.migrateFilePaths(previous, current);
-          }
+          this.logger.warn(
+            `Detected a change to media location, performing an automatic migration of file paths from ${previous} to ${current}, this may take awhile`,
+          );
+          await this.databaseRepository.migrateFilePaths(previous, current);
         }
       }
 
+      // Only set MediaLocation in systemMetadataRepository if needed
       if (savedValue?.location !== current) {
         await this.systemMetadataRepository.set(SystemMetadataKey.MediaLocation, { location: current });
       }
@@ -145,6 +136,7 @@ export class StorageService extends BaseService {
   async handleDeleteFiles(job: JobOf<JobName.FileDelete>): Promise<JobStatus> {
     const { files } = job;
 
+    // TODO: one job per file
     for (const file of files) {
       if (!file) {
         continue;
@@ -166,7 +158,7 @@ export class StorageService extends BaseService {
       await this.storageRepository.readFile(internalPath);
     } catch (error) {
       this.logger.error(`Failed to read (${internalPath}): ${error}`);
-      throw new ImmichStartupError(`Failed to read: \"${externalPath} (${internalPath}) - ${docsMessage}\"`);
+      throw new ImmichStartupError(`Failed to read: "${externalPath} (${internalPath}) - ${docsMessage}"`);
     }
   }
 
@@ -181,7 +173,7 @@ export class StorageService extends BaseService {
         return;
       }
       this.logger.error(`Failed to create ${internalPath}: ${error}`);
-      throw new ImmichStartupError(`Failed to create \"${externalPath} - ${docsMessage}\"`);
+      throw new ImmichStartupError(`Failed to create "${externalPath} - ${docsMessage}"`);
     }
   }
 
@@ -191,7 +183,7 @@ export class StorageService extends BaseService {
       await this.storageRepository.overwriteFile(internalPath, Buffer.from(Date.now().toString()));
     } catch (error) {
       this.logger.error(`Failed to write ${internalPath}: ${error}`);
-      throw new ImmichStartupError(`Failed to write \"${externalPath} - ${docsMessage}\"`);
+      throw new ImmichStartupError(`Failed to write "${externalPath} - ${docsMessage}"`);
     }
   }
 

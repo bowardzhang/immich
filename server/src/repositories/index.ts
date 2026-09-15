@@ -5,8 +5,10 @@ import { AlbumRepository } from 'src/repositories/album.repository';
 import { ApiKeyRepository } from 'src/repositories/api-key.repository';
 import { AppRepository } from 'src/repositories/app.repository';
 import { AssetEditRepository } from 'src/repositories/asset-edit.repository';
+import { AssetFileRepository } from 'src/repositories/asset-file.repository';
 import { AssetJobRepository } from 'src/repositories/asset-job.repository';
 import { AssetRepository } from 'src/repositories/asset.repository';
+import { ClusterGroupRepository } from 'src/repositories/cluster-group.repository';
 import { ConfigRepository } from 'src/repositories/config.repository';
 import { CronRepository } from 'src/repositories/cron.repository';
 import { CryptoRepository } from 'src/repositories/crypto.repository';
@@ -32,8 +34,6 @@ import { PartnerRepository } from 'src/repositories/partner.repository';
 import { PersonRepository } from 'src/repositories/person.repository';
 import { PluginRepository } from 'src/repositories/plugin.repository';
 import { ProcessRepository } from 'src/repositories/process.repository';
-import { RemoteMediaAdapterRepository } from 'src/repositories/remote-media-adapter.repository';
-import { RemoteStorageRepository } from 'src/repositories/remote-storage.repository';
 import { SearchRepository } from 'src/repositories/search.repository';
 import { ServerInfoRepository } from 'src/repositories/server-info.repository';
 import { SessionRepository } from 'src/repositories/session.repository';
@@ -63,6 +63,7 @@ export const repositories = [
   AppRepository,
   AssetRepository,
   AssetEditRepository,
+  AssetFileRepository,
   AssetJobRepository,
   ConfigRepository,
   CronRepository,
@@ -85,12 +86,11 @@ export const repositories = [
   NotificationRepository,
   OAuthRepository,
   OcrRepository,
+  ClusterGroupRepository,
   PartnerRepository,
   PersonRepository,
   PluginRepository,
   ProcessRepository,
-  RemoteStorageRepository,
-  RemoteMediaAdapterRepository,
   SearchRepository,
   SessionRepository,
   ServerInfoRepository,
@@ -105,9 +105,9 @@ export const repositories = [
   TelemetryRepository,
   TrashRepository,
   UserRepository,
+  ViewRepository,
   VersionHistoryRepository,
   VideoStreamRepository,
-  ViewRepository,
   WebsocketRepository,
   WorkflowRepository,
 ];

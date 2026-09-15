@@ -1,18 +1,4 @@
-import {
-  Body,
-  Controller,
-  Delete,
-  Get,
-  Headers,
-  HttpCode,
-  HttpException,
-  HttpStatus,
-  Param,
-  Post,
-  Put,
-  Query,
-  UnauthorizedException,
-} from '@nestjs/common';
+import { Body, Controller, Delete, Get, HttpCode, HttpStatus, Put } from '@nestjs/common';
 import { ApiNotFoundResponse, ApiTags } from '@nestjs/swagger';
 import { Endpoint, HistoryBuilder } from 'src/decorators';
 import { LicenseKeyDto, LicenseResponseDto } from 'src/dtos/license.dto';
@@ -43,55 +29,6 @@ export class ServerController {
     private systemMetadataService: SystemMetadataService,
     private versionService: VersionService,
   ) {}
-
-  private requireStorageIndexToken(authorization?: string) {
-    const token = process.env.REMOTE_STORAGE_TOKEN || '';
-    if (token && authorization !== `Bearer ${token}`) {
-      throw new UnauthorizedException();
-    }
-  }
-
-  private async proxyStorageIndex(
-    pathname: string,
-    authorization?: string,
-    method: 'GET' | 'POST' = 'GET',
-    body?: Record<string, unknown>,
-  ): Promise<unknown> {
-    this.requireStorageIndexToken(authorization);
-    const response = await fetch(`http://127.0.0.1:3004/${pathname}`, {
-      method,
-      headers: {
-        ...(authorization ? { authorization } : {}),
-        ...(body ? { 'content-type': 'application/json' } : {}),
-      },
-      ...(body ? { body: JSON.stringify(body) } : {}),
-      signal: AbortSignal.timeout(5_000),
-    });
-    const data = await response.json().catch(() => ({ error: `Storage index returned ${response.status}` }));
-    if (!response.ok) throw new HttpException(data, response.status);
-    return data;
-  }
-
-  @Get('storage-index/lookup')
-  getStorageIndexEntry(@Headers('authorization') authorization: string | undefined, @Query('path') path = ''): Promise<unknown> {
-    return this.proxyStorageIndex(`lookup?path=${encodeURIComponent(path)}`, authorization);
-  }
-
-  @Get('storage-index/stats')
-  getStorageIndexStats(@Headers('authorization') authorization: string | undefined): Promise<unknown> {
-    return this.proxyStorageIndex('stats', authorization);
-  }
-
-  @Post('storage-index/:action')
-  updateStorageIndex(
-    @Headers('authorization') authorization: string | undefined,
-    @Param('action') action: string,
-    @Body() body: Record<string, unknown>,
-  ): Promise<unknown> {
-    const allowed = new Set(['upsert', 'bulk-upsert', 'delete', 'move']);
-    if (!allowed.has(action)) throw new HttpException({ error: 'Unsupported storage index action' }, HttpStatus.NOT_FOUND);
-    return this.proxyStorageIndex(action, authorization, 'POST', body);
-  }
 
   @Get('about')
   @Authenticated({ permission: Permission.ServerAbout })
@@ -127,6 +64,7 @@ export class ServerController {
   }
 
   @Get('ping')
+  @Authenticated({ public: true })
   @Endpoint({
     summary: 'Ping',
     description: 'Pong',
@@ -137,6 +75,7 @@ export class ServerController {
   }
 
   @Get('version')
+  @Authenticated({ public: true })
   @Endpoint({
     summary: 'Get server version',
     description: 'Retrieve the current server version in semantic versioning (semver) format.',
@@ -147,6 +86,7 @@ export class ServerController {
   }
 
   @Get('version-history')
+  @Authenticated({ public: true })
   @Endpoint({
     summary: 'Get version history',
     description: 'Retrieve a list of past versions the server has been on.',
@@ -157,20 +97,30 @@ export class ServerController {
   }
 
   @Get('features')
+  @Authenticated({ public: true })
   @Endpoint({
     summary: 'Get features',
     description: 'Retrieve available features supported by this server.',
-    history: new HistoryBuilder().added('v1').beta('v1').stable('v2'),
+    history: new HistoryBuilder()
+      .added('v1')
+      .beta('v1')
+      .stable('v2')
+      .deprecated('v3.2.0', { replacementId: 'getPublicConfig' }),
   })
   getServerFeatures(): Promise<ServerFeaturesDto> {
     return this.service.getFeatures();
   }
 
   @Get('config')
+  @Authenticated({ public: true })
   @Endpoint({
     summary: 'Get config',
     description: 'Retrieve the current server configuration.',
-    history: new HistoryBuilder().added('v1').beta('v1').stable('v2'),
+    history: new HistoryBuilder()
+      .added('v1')
+      .beta('v1')
+      .stable('v2')
+      .deprecated('v3.2.0', { replacementId: 'getPublicConfig' }),
   })
   getServerConfig(): Promise<ServerConfigDto> {
     return this.service.getSystemConfig();
@@ -188,6 +138,7 @@ export class ServerController {
   }
 
   @Get('media-types')
+  @Authenticated({ public: true })
   @Endpoint({
     summary: 'Get supported media types',
     description: 'Retrieve all media types supported by the server.',
@@ -224,8 +175,8 @@ export class ServerController {
   @Authenticated({ permission: Permission.ServerLicenseDelete, admin: true })
   @HttpCode(HttpStatus.NO_CONTENT)
   @Endpoint({
-    summary: 'Delete product key',
-    description: 'Delete the currently set product key.',
+    summary: 'Delete server product key',
+    description: 'Delete the currently set server product key.',
     history: new HistoryBuilder().added('v1').beta('v1').stable('v2'),
   })
   deleteServerLicense(): Promise<void> {

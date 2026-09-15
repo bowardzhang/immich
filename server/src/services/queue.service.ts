@@ -1,7 +1,7 @@
 import { BadRequestException, Injectable } from '@nestjs/common';
-import { SystemConfig } from 'src/config';
 import { OnEvent } from 'src/decorators';
 import { AuthDto } from 'src/dtos/auth.dto';
+import { SystemConfig } from 'src/dtos/config.dto';
 import {
   mapQueueLegacy,
   mapQueuesLegacy,
@@ -76,20 +76,10 @@ export class QueueService extends BaseService {
   }
 
   @OnEvent({ name: 'AppBootstrap', priority: BootstrapEventPriority.JobService })
-  async onBootstrap() {
+  onBootstrap() {
     this.jobRepository.setup(this.services);
     if (this.worker === ImmichWorker.Microservices) {
       this.jobRepository.startWorkers();
-      if (process.env.IMMICH_AIO_REPAIR_THUMBNAILS_ON_BOOT === 'true') {
-        this.logger.log('One-shot thumbnail repair requested; queueing forced regeneration for all assets');
-        await this.jobRepository.queue({ name: JobName.AssetGenerateThumbnailsQueueAll, data: { force: true } });
-      }
-
-      const repairAssetId = process.env.IMMICH_AIO_REPAIR_THUMBNAIL_ASSET_ID?.trim();
-      if (repairAssetId) {
-        this.logger.log(`One-shot thumbnail repair requested for asset ${repairAssetId}`);
-        await this.jobRepository.queue({ name: JobName.AssetGenerateThumbnails, data: { id: repairAssetId } });
-      }
     } else if (this.worker === ImmichWorker.Api) {
       this.jobRepository.watchWorkers();
     }

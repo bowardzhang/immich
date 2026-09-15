@@ -27,7 +27,6 @@ import { DatabaseRepository } from 'src/repositories/database.repository';
 import { EventRepository } from 'src/repositories/event.repository';
 import { LoggingRepository } from 'src/repositories/logging.repository';
 import { ProcessRepository } from 'src/repositories/process.repository';
-import { RemoteStorageRepository } from 'src/repositories/remote-storage.repository';
 import { StorageRepository } from 'src/repositories/storage.repository';
 import { SystemMetadataRepository } from 'src/repositories/system-metadata.repository';
 import { teardownTelemetry, TelemetryRepository } from 'src/repositories/telemetry.repository';
@@ -117,7 +116,6 @@ export class ApiModule extends BaseModule {}
     ConfigRepository,
     LoggingRepository,
     StorageRepository,
-    RemoteStorageRepository,
     ProcessRepository,
     DatabaseRepository,
     UserRepository,

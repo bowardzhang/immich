@@ -1,11 +1,7 @@
 import { Injectable } from '@nestjs/common';
 import { BinaryField, DefaultReadTaskOptions, ExifTool, ReadTaskOptions, Tags } from 'exiftool-vendored';
 import geotz from 'geo-tz';
-import fs from 'node:fs/promises';
-import os from 'node:os';
-import path from 'node:path';
 import { LoggingRepository } from 'src/repositories/logging.repository';
-import { RemoteStorageRepository } from 'src/repositories/remote-storage.repository';
 import { mimeTypes } from 'src/utils/mime-types';
 
 interface ExifDuration {
@@ -24,7 +20,8 @@ type TagsWithWrongTypes =
   | 'TagsList'
   | 'Keywords'
   | 'HierarchicalSubject'
-  | 'ISO';
+  | 'ISO'
+  | 'LensModel';
 
 export interface ImmichTags extends Omit<Tags, TagsWithWrongTypes> {
   ContentIdentifier?: string;
@@ -46,6 +43,9 @@ export interface ImmichTags extends Omit<Tags, TagsWithWrongTypes> {
   // Type is wrong, can also be number.
   Description?: StringOrNumber;
   ImageDescription?: StringOrNumber;
+
+  // Apparently LensModel can also be a float: https://github.com/immich-app/immich/issues/30492
+  LensModel?: StringOrNumber;
 
   // Extended properties for image regions, such as faces
   RegionInfo?: {
@@ -92,16 +92,23 @@ export class MetadataRepository {
     /* eslint unicorn/no-array-callback-reference: off, unicorn/no-array-method-this-argument: off */
     geoTz: (lat, lon) => geotz.find(lat, lon)[0],
     geolocation: true,
-    // Enable exiftool LFS to parse metadata for files larger than 2GB.
-    readArgs: ['-api', 'largefilesupport=1', '--ICC_Profile:DeviceManufacturer', '--ICC_Profile:DeviceModelName'],
+    readArgs: [
+      // Enable exiftool LFS to parse metadata for files larger than 2GB.
+      '-api',
+      'largefilesupport=1',
+      '--ICC_Profile:DeviceManufacturer',
+      '--ICC_Profile:DeviceModelName',
+      // Ignore embedded thumbnail dimensions/orientation for the main asset.
+      '--IFD1:Orientation',
+      '--MWG:Orientation',
+      '--IFD1:ImageWidth',
+      '--IFD1:ImageHeight',
+    ],
     writeArgs: ['-api', 'largefilesupport=1', '-overwrite_original'],
     taskTimeoutMillis: 2 * 60 * 1000,
   });
 
-  constructor(
-    private logger: LoggingRepository,
-    private remoteStorageRepository: RemoteStorageRepository,
-  ) {
+  constructor(private logger: LoggingRepository) {
     this.logger.setContext(MetadataRepository.name);
   }
 
@@ -113,35 +120,17 @@ export class MetadataRepository {
     await this.exiftool.end();
   }
 
-  private async withLocalPath<T>(filePath: string, operation: (localPath: string) => Promise<T>, writeBack = false): Promise<T> {
-    if (!this.remoteStorageRepository.isRemotePath(filePath)) return operation(filePath);
-
-    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'immich-remote-metadata-'));
-    const localPath = path.join(tempDir, path.basename(filePath) || 'media');
-    try {
-      const buffer = await this.remoteStorageRepository.readFile(filePath);
-      await fs.writeFile(localPath, buffer);
-      const result = await operation(localPath);
-      if (writeBack) {
-        await this.remoteStorageRepository.createFile(filePath, await fs.readFile(localPath));
-      }
-      return result;
-    } finally {
-      await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
-    }
-  }
-
   readTags(path: string): Promise<ImmichTags> {
     const options: ReadTaskOptions | undefined = mimeTypes.isVideo(path) ? { readArgs: ['-ee'] } : undefined;
 
-    return this.withLocalPath(path, (localPath) => this.exiftool.read(localPath, options)).catch((error) => {
+    return this.exiftool.read(path, options).catch((error) => {
       this.logger.warn(`Error reading exif data (${path}): ${error}\n${error?.stack}`);
       return {};
     }) as Promise<ImmichTags>;
   }
 
   extractBinaryTag(path: string, tagName: string): Promise<Buffer> {
-    return this.withLocalPath(path, (localPath) => this.exiftool.extractBinaryTagToBuffer(tagName, localPath));
+    return this.exiftool.extractBinaryTagToBuffer(tagName, path);
   }
 
   async writeTags(path: string, tags: Partial<Tags>): Promise<void> {
@@ -150,7 +139,7 @@ export class MetadataRepository {
     // https://exiftool.org/exiftool_pod.html#:~:text=is%20used%20to%20write%20an%20empty%20string
     const tagsToWrite = Object.fromEntries(Object.entries(tags).map(([key, value]) => [`${key}^`, value]));
     try {
-      await this.withLocalPath(path, (localPath) => this.exiftool.write(localPath, tagsToWrite), true);
+      await this.exiftool.write(path, tagsToWrite);
     } catch (error) {
       this.logger.warn(`Error writing exif data (${path}): ${error}`);
     }

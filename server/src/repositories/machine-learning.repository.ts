@@ -1,10 +1,8 @@
 import { Injectable } from '@nestjs/common';
 import { Duration } from 'luxon';
 import { readFile } from 'node:fs/promises';
-import { MachineLearningConfig } from 'src/config';
-import { CLIPConfig } from 'src/dtos/model-config.dto';
+import { MachineLearningConfig } from 'src/dtos/config.dto';
 import { LoggingRepository } from 'src/repositories/logging.repository';
-import { RemoteStorageRepository } from 'src/repositories/remote-storage.repository';
 
 export interface BoundingBox {
   x1: number;
@@ -74,7 +72,6 @@ export interface Face {
 }
 
 export type FacialRecognitionResponse = { [ModelTask.FACIAL_RECOGNITION]: Face[] } & VisualResponse;
-export type DetectedFaces = { faces: Face[] } & VisualResponse;
 export type MachineLearningRequest = ClipVisualRequest | ClipTextualRequest | FacialRecognitionRequest | OcrRequest;
 export type TextEncodingOptions = ModelOptions & { language?: string };
 
@@ -92,10 +89,7 @@ export class MachineLearningRepository {
     return this._config;
   }
 
-  constructor(
-    private logger: LoggingRepository,
-    private remoteStorageRepository: RemoteStorageRepository,
-  ) {
+  constructor(private logger: LoggingRepository) {
     this.logger.setContext(MachineLearningRepository.name);
   }
 
@@ -119,10 +113,6 @@ export class MachineLearningRepository {
       () => this.tick(),
       Duration.fromObject({ milliseconds: config.availabilityChecks.interval }).as('milliseconds'),
     );
-  }
-
-  getConfig() {
-    return this.config;
   }
 
   teardown() {
@@ -185,12 +175,10 @@ export class MachineLearningRepository {
         }
 
         this.logger.warn(
-          `Machine learning request to \"${url}\" failed with status ${response.status}: ${response.statusText}`,
+          `Machine learning request to "${url}" failed with status ${response.status}: ${response.statusText}`,
         );
       } catch (error: Error | unknown) {
-        this.logger.warn(
-          `Machine learning request to \"${url}\" failed: ${error instanceof Error ? error.message : error}`,
-        );
+        this.logger.warn(`Machine learning request to "${url}" failed`, error);
       }
 
       this.setHealthy(url, false);
@@ -214,7 +202,7 @@ export class MachineLearningRepository {
     };
   }
 
-  async encodeImage(imagePath: string, { modelName }: CLIPConfig) {
+  async encodeImage(imagePath: string, { modelName }: MachineLearningConfig['clip']) {
     const request = { [ModelTask.SEARCH]: { [ModelType.VISUAL]: { modelName } } };
     const response = await this.predict<ClipVisualResponse>({ imagePath }, request);
     return response[ModelTask.SEARCH];
@@ -242,9 +230,7 @@ export class MachineLearningRepository {
     formData.append('entries', JSON.stringify(config));
 
     if ('imagePath' in payload) {
-      const fileBuffer = this.remoteStorageRepository.isRemotePath(payload.imagePath)
-        ? await this.remoteStorageRepository.readFile(payload.imagePath)
-        : await readFile(payload.imagePath);
+      const fileBuffer = await readFile(payload.imagePath);
       formData.append('image', new Blob([new Uint8Array(fileBuffer)]));
     } else if ('text' in payload) {
       formData.append('text', payload.text);

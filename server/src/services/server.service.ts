@@ -26,15 +26,8 @@ import {
   isSmartSearchEnabled,
 } from 'src/utils/misc';
 
-interface RemoteStorageInfo {
-  totalBytes: number;
-  availableBytes: number;
-}
-
 @Injectable()
 export class ServerService extends BaseService {
-  private remoteStorageInfoCache: RemoteStorageInfo | null = null;
-
   @OnEvent({ name: 'AppBootstrap' })
   async onBootstrap(): Promise<void> {
     const featureFlags = await this.getFeatures();
@@ -71,71 +64,19 @@ export class ServerService extends BaseService {
     };
   }
 
-  private async getRemoteStorageInfo(): Promise<RemoteStorageInfo | null> {
-    const remoteStorageUrl = process.env.REMOTE_STORAGE_URL?.replace(/\/$/, '');
-    if (!remoteStorageUrl) {
-      return null;
-    }
-
-    try {
-      const token = process.env.REMOTE_STORAGE_TOKEN;
-      const timeoutMs = Number(process.env.REMOTE_STORAGE_INFO_TIMEOUT_MS || 20_000);
-      const response = await fetch(`${remoteStorageUrl}/api/storage`, {
-        headers: token ? { authorization: `Bearer ${token}` } : undefined,
-        signal: AbortSignal.timeout(Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : 20_000),
-      });
-      if (!response.ok) {
-        throw new Error(`${response.status} ${response.statusText}`);
-      }
-
-      const data = (await response.json()) as Partial<RemoteStorageInfo>;
-      const totalBytes = Number(data.totalBytes ?? 0);
-      const availableBytes = Number(data.availableBytes ?? 0);
-      if (!Number.isFinite(totalBytes) || !Number.isFinite(availableBytes) || totalBytes <= 0 || availableBytes < 0) {
-        throw new Error('Storage Router returned invalid capacity data');
-      }
-
-      const info = { totalBytes, availableBytes: Math.min(availableBytes, totalBytes) };
-      this.remoteStorageInfoCache = info;
-      return info;
-    } catch (error) {
-      if (this.remoteStorageInfoCache) {
-        this.logger.warn(`Unable to refresh aggregate remote storage capacity; using last successful value: ${error}`);
-        return this.remoteStorageInfoCache;
-      }
-      this.logger.warn(`Unable to read aggregate remote storage capacity; falling back to local storage: ${error}`);
-      return null;
-    }
-  }
-
   async getStorage(): Promise<ServerStorageResponseDto> {
-    const remoteDiskInfo = await this.getRemoteStorageInfo();
-    let total: number;
-    let available: number;
-    let free: number;
+    const libraryBase = StorageCore.getBaseFolder(StorageFolder.Library);
+    const diskInfo = await this.storageRepository.checkDiskUsage(libraryBase);
 
-    if (remoteDiskInfo) {
-      total = remoteDiskInfo.totalBytes;
-      available = remoteDiskInfo.availableBytes;
-      free = remoteDiskInfo.availableBytes;
-    } else {
-      const libraryBase = StorageCore.getBaseFolder(StorageFolder.Library);
-      const diskInfo = await this.storageRepository.checkDiskUsage(libraryBase);
-      total = diskInfo.total;
-      available = diskInfo.available;
-      free = diskInfo.free;
-    }
-
-    const used = Math.max(0, total - free);
-    const usagePercentage = total > 0 ? ((used / total) * 100).toFixed(2) : '0.00';
+    const usagePercentage = (((diskInfo.total - diskInfo.free) / diskInfo.total) * 100).toFixed(2);
 
     const serverInfo = new ServerStorageResponseDto();
-    serverInfo.diskAvailable = asHumanReadable(available);
-    serverInfo.diskSize = asHumanReadable(total);
-    serverInfo.diskUse = asHumanReadable(used);
-    serverInfo.diskAvailableRaw = available;
-    serverInfo.diskSizeRaw = total;
-    serverInfo.diskUseRaw = used;
+    serverInfo.diskAvailable = asHumanReadable(diskInfo.available);
+    serverInfo.diskSize = asHumanReadable(diskInfo.total);
+    serverInfo.diskUse = asHumanReadable(diskInfo.total - diskInfo.free);
+    serverInfo.diskAvailableRaw = diskInfo.available;
+    serverInfo.diskSizeRaw = diskInfo.total;
+    serverInfo.diskUseRaw = diskInfo.total - diskInfo.free;
     serverInfo.diskUsagePercentage = Number(usagePercentage);
     return serverInfo;
   }
@@ -170,9 +111,8 @@ export class ServerService extends BaseService {
   }
 
   async getSystemConfig(): Promise<ServerConfigDto> {
-    const { setup } = this.configRepository.getEnv();
     const config = await this.getConfig({ withCache: false });
-    const isInitialized = !setup.allow || (await this.userRepository.hasAdmin());
+    const isInitialized = !(await this.isSetupAvailable());
     const onboarding = await this.systemMetadataRepository.get(SystemMetadataKey.AdminOnboarding);
 
     return {
@@ -180,6 +120,7 @@ export class ServerService extends BaseService {
       trashDays: config.trash.days,
       userDeleteDelay: config.user.deleteDelay,
       oauthButtonText: config.oauth.buttonText,
+      oauthAccountManagementUrl: config.oauth.accountManagementUrl,
       isInitialized,
       isOnboarded: onboarding?.isOnboarded || false,
       externalDomain: config.server.externalDomain,

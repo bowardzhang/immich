@@ -8,9 +8,6 @@ import { LoggingRepository } from 'src/repositories/logging.repository';
 import { ImmichReadStream } from 'src/repositories/storage.repository';
 import { isConnectionAborted } from 'src/utils/misc';
 
-const REMOTE_MEDIA_PREFIX = '/remote/photo-extern';
-const LOCAL_MEDIA_PREFIX = '/data';
-
 export function getFileNameWithoutExtension(path: string): string {
   return basename(path, getFilenameExtension(path));
 }
@@ -44,73 +41,7 @@ const cacheControlHeaders: Record<CacheControl, string | null> = {
   [CacheControl.PrivateWithCache]:
     'private, max-age=86400, no-transform, stale-while-revalidate=2592000, stale-if-error=2592000',
   [CacheControl.PrivateWithoutCache]: 'private, no-cache, no-transform',
-  [CacheControl.None]: null,
-};
-
-const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
-
-const sendRemoteFile = async (res: Response, path: string): Promise<number> => {
-  const baseUrl = (process.env.REMOTE_STORAGE_URL || '').replace(/\/$/, '');
-  const token = process.env.REMOTE_STORAGE_TOKEN || '';
-  if (!baseUrl) throw new Error('REMOTE_STORAGE_URL is not configured');
-
-  const relative = path.slice(REMOTE_MEDIA_PREFIX.length).replace(/^\/+/, '');
-  const encodedPath = encodeURIComponent(relative);
-  const range = res.req.headers.range;
-  const headers: Record<string, string> = {};
-  if (token) headers.authorization = `Bearer ${token}`;
-  if (range) headers.range = range;
-
-  const target = `${baseUrl}/api/file?path=${encodedPath}`;
-  const attempts = Number(process.env.REMOTE_STORAGE_FETCH_ATTEMPTS || 4);
-  const retryDelayMs = Number(process.env.REMOTE_STORAGE_FETCH_RETRY_MS || 1000);
-  const timeoutMs = Number(process.env.REMOTE_STORAGE_FETCH_TIMEOUT_MS || 20_000);
-
-  let response: globalThis.Response | undefined;
-  let lastError: unknown;
-  for (let attempt = 1; attempt <= Math.max(1, attempts); attempt++) {
-    try {
-      response = await fetch(target, { headers, signal: AbortSignal.timeout(timeoutMs) });
-      break;
-    } catch (error) {
-      lastError = error;
-      if (attempt >= attempts) throw error;
-      await sleep(retryDelayMs);
-    }
-  }
-  if (!response) throw lastError instanceof Error ? lastError : new Error(String(lastError || 'Remote storage fetch failed'));
-
-  const responseHeaders = ['content-type', 'content-length', 'content-range', 'accept-ranges', 'etag', 'last-modified'];
-
-  res.status(response.status);
-  for (const header of responseHeaders) {
-    const value = response.headers.get(header);
-    if (value) res.set(header, value);
-  }
-
-  if (!response.body) {
-    res.end();
-    return response.status;
-  }
-
-  const reader = response.body.getReader();
-  try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      if (!res.write(Buffer.from(value))) await new Promise((resolve) => res.once('drain', resolve));
-    }
-    res.end();
-  } catch (error) {
-    res.destroy(error as Error);
-  }
-  return response.status;
-};
-
-const localToRemotePath = (filePath: string): string | undefined => {
-  if (filePath === LOCAL_MEDIA_PREFIX) return REMOTE_MEDIA_PREFIX;
-  if (!filePath.startsWith(`${LOCAL_MEDIA_PREFIX}/`)) return undefined;
-  return `${REMOTE_MEDIA_PREFIX}/${filePath.slice(`${LOCAL_MEDIA_PREFIX}/`.length)}`;
+  [CacheControl.None]: null, // falsy value to prevent adding Cache-Control header
 };
 
 export const sendFile = async (
@@ -119,14 +50,18 @@ export const sendFile = async (
   handler: () => Promise<ImmichFileResponse> | ImmichFileResponse,
   logger: LoggingRepository,
 ): Promise<void> => {
+  // promisified version of 'res.sendFile' for cleaner async handling
   const _sendFile = (path: string, options: SendFileOptions) =>
     promisify<string, SendFileOptions>(res.sendFile).bind(res)(path, options);
 
   try {
     const file = await handler();
 
+    await access(file.path, constants.R_OK);
+
     const cacheControlHeader = cacheControlHeaders[file.cacheControl];
     if (cacheControlHeader) {
+      // set the header to Cache-Control
       res.set('Cache-Control', cacheControlHeader);
     }
 
@@ -135,31 +70,14 @@ export const sendFile = async (
       res.header('Content-Disposition', `inline; filename*=UTF-8''${encodeURIComponent(file.fileName)}`);
     }
 
-    if (file.path === REMOTE_MEDIA_PREFIX || file.path.startsWith(`${REMOTE_MEDIA_PREFIX}/`)) {
-      await sendRemoteFile(res, file.path);
-      return;
-    }
-
-    try {
-      await access(file.path, constants.R_OK);
-      await _sendFile(file.path, { dotfiles: 'allow' });
-      return;
-    } catch (error: any) {
-      const remoteFallback = localToRemotePath(file.path);
-      if (error?.code !== 'ENOENT' || !remoteFallback || !process.env.REMOTE_STORAGE_URL) throw error;
-
-      logger.warn(`Local media missing, trying verified remote-storage fallback: ${file.path}`);
-      const status = await sendRemoteFile(res, remoteFallback);
-      if (status === 404) {
-        logger.warn(`Media missing from both local and remote storage: ${file.path}`);
-      }
-      return;
-    }
+    return await _sendFile(file.path, { dotfiles: 'allow' });
   } catch (error: Error | any) {
+    // ignore client-closed connection
     if (isConnectionAborted(error) || res.headersSent) {
       return;
     }
 
+    // log non-http errors
     if (!(error instanceof HttpException)) {
       logger.error(`Unable to send file: ${error}`, error.stack);
     }
@@ -168,6 +86,6 @@ export const sendFile = async (
   }
 };
 
-export const asStreamableFile = ({ stream, type, length }: ImmichReadStream) => {
-  return new StreamableFile(stream, { type, length });
+export const asStreamableFile = ({ stream, type, disposition, length }: ImmichReadStream) => {
+  return new StreamableFile(stream, { type, disposition, length });
 };
