@@ -28,27 +28,25 @@ This tuning is intentionally limited to the automatic foreground-backup path. It
 
 ### 3. Works with the server-side streaming upload path
 
-The server side of this fork no longer stages the whole incoming asset on the Immich server before forwarding it to Storage Router. The current upload path is:
+The server side of this fork forwards original media through the remote-storage path:
 
 ```text
-Android -> Immich streaming -> Storage Router temporary staging -> Photo Storage N
+Android -> Immich streaming -> Storage Router temporary staging -> Photo Storage 1-9
 ```
 
-That removes one full-file serial copy from the critical upload path. The Router still stages the received stream once so it can safely retry/fail over to another Photo Storage node.
+The Router stages the received stream ephemerally so it can safely retry/fail over to another fixed Photo Storage node.
 
 ### 4. Better behavior for large videos
 
-The combination of a longer client timeout, one automatic-backup upload worker and the streaming server path is intended to reduce failures seen with large videos that previously approached the Railway request-duration limit.
+The combination of a longer client timeout, one automatic-backup upload worker and the streaming server path is intended to reduce failures seen with large videos that approach platform/network request-duration limits.
 
 It does **not** make a single HTTP upload resumable. If one individual file still cannot finish before the platform/network limit, the next architectural step is chunked/resumable upload rather than an even larger timeout.
 
-## Installation
+## Build and installation
 
-Download the APK from this repository's **GitHub Releases** page. The current release is tagged:
+The 3.2.1 build workflow is isolated to the `3.2.1-remote` branch. After a successful build, run the publish workflow with that build's GitHub Actions run ID. It publishes the 3.2.1-specific debug APK/release without reusing a 3.1.0 artifact.
 
-`android-v3.1.0-remote.1`
-
-The published build is a **debug APK** intended for testing this fork. It uses a separate debug application ID, so it can normally coexist with the Play Store Immich app. You will need to configure the server URL and sign in again in the test app.
+The debug application can normally coexist with the Play Store Immich app, but it requires separate server configuration/login.
 
 ## When to use it
 
@@ -56,10 +54,16 @@ Use this APK when your Android backup contains large photos/videos and the stand
 
 ## Compatibility
 
-- Server baseline: Immich `v3.1.0`
-- Fork branch: `3.1.0-remote`
-- Android source baseline: Immich mobile `3.1.0`
+- Server baseline: Immich `v3.2.1`
+- Fork branch: `3.2.1-remote`
+- Android source baseline: Immich mobile `3.2.1`
+- Remote pool: fixed `Photo Storage 1-9`
+- Storage Router and Photo Storage nodes: Serverless
 - Intended server: this repository's Railway multi-volume fork
+
+## Branch isolation
+
+Do not publish a 3.2.1 APK from `3.1.0-remote`, reuse a 3.1.0 build run, or point the 3.2.1 release at the old branch. The two remote branches are maintained independently so the production deployment can be rolled back without rewriting either branch.
 
 ## Safety notes
 
