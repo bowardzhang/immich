@@ -34,6 +34,29 @@ jobs:
           node-version: 22
       - name: Verify v3.2.1 MediaRepository patch still applies
         run: node ./all-in-one/patch-remote-media-input.mjs
+      - name: Verify all remote media input wrappers are present
+        run: |
+          node <<'NODE'
+          const fs = require('node:fs');
+          const source = fs.readFileSync('server/src/repositories/media.repository.ts', 'utf8');
+          const required = [
+            'this.withAvailableInput(input, (availableInput) => this.extractAvailable(availableInput))',
+            'this.withAvailableInput(input, (availableInput) =>\n      this.getImageDecodingPipeline(availableInput, options)',
+            'this.withAvailableInput(input, (availableInput) => this.generateThumbnailAvailable(availableInput, options, output))',
+            'this.withAvailableInput(input, (availableInput) => this.generateThumbhashAvailable(availableInput, options))',
+            'this.withAvailableInput(input, (availableInput) => this.probeAvailable(availableInput, options))',
+            'this.withAvailableInput(input, (availableInput) => this.probePacketsAvailable(availableInput, streamIndex))',
+            'this.withAvailableInput(input, (availableInput) => this.transcodeAvailable(availableInput, output, options))',
+            'return this.withAvailableInput(input, async (availableInput) => {',
+            'private async withAvailableInput<T>',
+          ];
+          const missing = required.filter((needle) => !source.includes(needle));
+          if (missing.length) {
+            console.error('Missing remote media patch assertions:', missing);
+            process.exit(1);
+          }
+          console.log(`Verified ${required.length} remote media patch assertions`);
+          NODE
 
   server-check:
     runs-on: ubuntu-latest
