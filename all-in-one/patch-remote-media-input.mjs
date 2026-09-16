@@ -23,6 +23,12 @@ replaceOnce(
 );
 
 replaceOnce(
+  `  async copyTagGroup(tagGroup: string, source: string, target: string): Promise<boolean> {\n    try {\n      await exiftool.write(\n        target,\n        {},\n        {\n          ignoreMinorErrors: true,\n          writeArgs: ['-TagsFromFile', source, \`-\${tagGroup}:all>\${tagGroup}:all\`, '-overwrite_original'],\n        },\n      );\n      return true;\n    } catch (error: any) {\n      this.logger.warn(\`Could not copy tag data to image: \${error.message}\`);\n      return false;\n    }\n  }`,
+  `  async copyTagGroup(tagGroup: string, source: string, target: string): Promise<boolean> {\n    return this.withAvailableInput(source, (availableSource) => this.copyTagGroupAvailable(tagGroup, availableSource, target));\n  }\n\n  private async copyTagGroupAvailable(tagGroup: string, source: string, target: string): Promise<boolean> {\n    try {\n      await exiftool.write(\n        target,\n        {},\n        {\n          ignoreMinorErrors: true,\n          writeArgs: ['-TagsFromFile', source, \`-\${tagGroup}:all>\${tagGroup}:all\`, '-overwrite_original'],\n        },\n      );\n      return true;\n    } catch (error: any) {\n      this.logger.warn(\`Could not copy tag data to image: \${error.message}\`);\n      return false;\n    }\n  }`,
+  'copyTagGroup',
+);
+
+replaceOnce(
   `  decodeImage(input: string | Buffer, options: DecodeToBufferOptions) {\n    return this.getImageDecodingPipeline(input, options).raw().toBuffer({ resolveWithObject: true });\n  }`,
   `  async decodeImage(input: string | Buffer, options: DecodeToBufferOptions) {\n    if (Buffer.isBuffer(input)) {\n      return this.getImageDecodingPipeline(input, options).raw().toBuffer({ resolveWithObject: true });\n    }\n\n    return this.withAvailableInput(input, (availableInput) =>\n      this.getImageDecodingPipeline(availableInput, options).raw().toBuffer({ resolveWithObject: true }),\n    );\n  }`,
   'decodeImage',
