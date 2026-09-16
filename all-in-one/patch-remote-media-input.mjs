@@ -17,9 +17,39 @@ replaceOnce(
 );
 
 replaceOnce(
+  `  async extract(input: string): Promise<ExtractResult | null> {\n    for (const { tag, format } of [`,
+  `  async extract(input: string): Promise<ExtractResult | null> {\n    return this.withAvailableInput(input, (availableInput) => this.extractAvailable(availableInput));\n  }\n\n  private async extractAvailable(input: string): Promise<ExtractResult | null> {\n    for (const { tag, format } of [`,
+  'extract',
+);
+
+replaceOnce(
   `  decodeImage(input: string | Buffer, options: DecodeToBufferOptions) {\n    return this.getImageDecodingPipeline(input, options).raw().toBuffer({ resolveWithObject: true });\n  }`,
   `  async decodeImage(input: string | Buffer, options: DecodeToBufferOptions) {\n    if (Buffer.isBuffer(input)) {\n      return this.getImageDecodingPipeline(input, options).raw().toBuffer({ resolveWithObject: true });\n    }\n\n    return this.withAvailableInput(input, (availableInput) =>\n      this.getImageDecodingPipeline(availableInput, options).raw().toBuffer({ resolveWithObject: true }),\n    );\n  }`,
   'decodeImage',
+);
+
+replaceOnce(
+  `  async generateThumbnail(input: string | Buffer, options: GenerateThumbnailOptions, output: string): Promise<void> {\n    await this.getImageDecodingPipeline(input, options)\n      .toFormat(options.format, {`,
+  `  async generateThumbnail(input: string | Buffer, options: GenerateThumbnailOptions, output: string): Promise<void> {\n    if (Buffer.isBuffer(input)) {\n      return this.generateThumbnailAvailable(input, options, output);\n    }\n    return this.withAvailableInput(input, (availableInput) => this.generateThumbnailAvailable(availableInput, options, output));\n  }\n\n  private async generateThumbnailAvailable(input: string | Buffer, options: GenerateThumbnailOptions, output: string): Promise<void> {\n    await this.getImageDecodingPipeline(input, options)\n      .toFormat(options.format, {`,
+  'generateThumbnail',
+);
+
+replaceOnce(
+  `  async generateThumbhash(input: string | Buffer, options: GenerateThumbhashOptions): Promise<Buffer> {\n    const { rgbaToThumbHash } = await import('thumbhash');`,
+  `  async generateThumbhash(input: string | Buffer, options: GenerateThumbhashOptions): Promise<Buffer> {\n    if (Buffer.isBuffer(input)) {\n      return this.generateThumbhashAvailable(input, options);\n    }\n    return this.withAvailableInput(input, (availableInput) => this.generateThumbhashAvailable(availableInput, options));\n  }\n\n  private async generateThumbhashAvailable(input: string | Buffer, options: GenerateThumbhashOptions): Promise<Buffer> {\n    const { rgbaToThumbHash } = await import('thumbhash');`,
+  'generateThumbhash',
+);
+
+replaceOnce(
+  `  async probe(input: string, options?: ProbeOptions): Promise<VideoInfo> {\n    const results = await probe(input, options?.countFrames ? ['-count_packets'] : []);`,
+  `  async probe(input: string, options?: ProbeOptions): Promise<VideoInfo> {\n    return this.withAvailableInput(input, (availableInput) => this.probeAvailable(availableInput, options));\n  }\n\n  private async probeAvailable(input: string, options?: ProbeOptions): Promise<VideoInfo> {\n    const results = await probe(input, options?.countFrames ? ['-count_packets'] : []);`,
+  'probe',
+);
+
+replaceOnce(
+  `  probePackets(input: string, streamIndex: number): Promise<VideoPacketInfo | null> {\n    const ffprobe = spawn(`,
+  `  probePackets(input: string, streamIndex: number): Promise<VideoPacketInfo | null> {\n    return this.withAvailableInput(input, (availableInput) => this.probePacketsAvailable(availableInput, streamIndex));\n  }\n\n  private probePacketsAvailable(input: string, streamIndex: number): Promise<VideoPacketInfo | null> {\n    const ffprobe = spawn(`,
+  'probePackets',
 );
 
 replaceOnce(
@@ -35,4 +65,4 @@ replaceOnce(
 );
 
 await fs.writeFile(file, source);
-console.log('[aio-build] patched MediaRepository to stage missing /data media from remote storage');
+console.log('[aio-build] patched MediaRepository to stage all missing /data media processing inputs from remote storage');
