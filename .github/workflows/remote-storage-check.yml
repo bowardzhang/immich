@@ -41,6 +41,8 @@ jobs:
           const source = fs.readFileSync('server/src/repositories/media.repository.ts', 'utf8');
           const required = [
             'this.withAvailableInput(input, (availableInput) => this.extractAvailable(availableInput))',
+            'this.withAvailableInput(source, (availableSource) => this.copyTagGroupAvailable(tagGroup, availableSource, target))',
+            'private async copyTagGroupAvailable(tagGroup: string, source: string, target: string)',
             'this.withAvailableInput(input, (availableInput) =>\n      this.getImageDecodingPipeline(availableInput, options)',
             'this.withAvailableInput(input, (availableInput) => this.generateThumbnailAvailable(availableInput, options, output))',
             'this.withAvailableInput(input, (availableInput) => this.generateThumbhashAvailable(availableInput, options))',
